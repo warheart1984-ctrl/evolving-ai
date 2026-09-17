@@ -322,6 +322,62 @@ class ConstitutionGates:
         )
 
     @staticmethod
+    def check_required_suites(evaluation: Evaluation, constitution=None) -> GateResult:
+        """Require every suite named in ``evaluation_rules.required_suites`` to pass.
+
+        Each required suite must have replay evidence tagged with its ``suite_id``
+        whose candidate replay correctness clears the minimum correctness
+        threshold. Fails closed when evidence is missing or malformed.
+        """
+        rules = getattr(constitution, "evaluation_rules", {}) or {}
+        required = [
+            str(suite_id)
+            for suite_id in rules.get("required_suites", []) or []
+        ]
+        min_correctness = rules.get("min_correctness", 0.80)
+        if not required:
+            return GateResult(
+                gate_name="required_suites_pass",
+                passed=True,
+                details={"reason": "no required suites configured", "required_suites": []},
+                required_approval=True,
+            )
+
+        seen: Dict[str, Dict[str, Any]] = {}
+        for evidence in evaluation.evidence:
+            results = evidence.results or {}
+            suite_id = results.get("suite_id")
+            if suite_id:
+                seen[str(suite_id)] = results.get("candidate") or {}
+
+        missing = [suite_id for suite_id in required if suite_id not in seen]
+        failing = []
+        per_suite = {}
+        for suite_id in required:
+            if suite_id not in seen:
+                continue
+            candidate = seen[suite_id]
+            total = candidate.get("total", 0) or 0
+            correctness = candidate.get("correctness_avg", 0.0) or 0.0
+            per_suite[suite_id] = correctness
+            if total == 0 or correctness < min_correctness:
+                failing.append(suite_id)
+
+        passed = not missing and not failing
+        return GateResult(
+            gate_name="required_suites_pass",
+            passed=passed,
+            details={
+                "required_suites": required,
+                "min_correctness": min_correctness,
+                "missing": missing,
+                "failing": failing,
+                "suite_correctness": per_suite,
+            },
+            required_approval=True,
+        )
+
+    @staticmethod
     def check_all_gates(evaluation: Evaluation, constitution=None) -> Dict[str, GateResult]:
         """Evaluate all constitution-declared gates.
 
@@ -340,6 +396,18 @@ class ConstitutionGates:
             "latency_within_budget": ConstitutionGates.check_latency_delta(evaluation, constitution),
             "cost_within_budget": ConstitutionGates.check_cost_delta(evaluation, constitution),
         }
+        # Bind the required-suites gate only when the constitution configures it.
+        # A default Constitution() enforces nothing extra, so synthetic approval
+        # tests that never attached suite evidence keep their existing semantics.
+        required_configured = bool(
+            (getattr(constitution, "evaluation_rules", {}) or {}).get("required_suites", [])
+        )
+        if required_configured or "required_suites_pass" in set(
+            (getattr(constitution, "promotion_gates", {}) or {}).keys()
+        ):
+            bound["required_suites_pass"] = ConstitutionGates.check_required_suites(
+                evaluation, constitution
+            )
         results = {k: v for k, v in bound.items()}
         # Fail closed: declared gates with no bound handler cannot pass.
         declared = set((getattr(constitution, "promotion_gates", {}) or {}).keys())

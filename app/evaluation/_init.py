@@ -245,7 +245,11 @@ class Evaluator:
             operator_result = Operator(
                 registry=self.registry,
                 current_runtime=runtime,
-            ).execute_task(task_id=task_id, input_data=input_data)
+            ).execute_task(
+                task_id=task_id,
+                input_data=input_data,
+                task_type=task_def.get("type", "general"),
+            )
             actual_output = operator_result.output
         except (ValueError, ArithmeticError) as e:
             # Malicious or malformed input must fail the task without executing

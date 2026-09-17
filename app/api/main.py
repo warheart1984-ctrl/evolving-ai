@@ -340,21 +340,95 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core", _key: st
                 extra_tasks.append(rejection_case)
 
     try:
-        parent_result = evaluator.run_suite_against_runtime(
-            suite_id, amendment.parent_version, extra_tasks=extra_tasks
-        )
         candidate = governor.materialize_candidate(amendment)
         candidate_label = candidate.version
-        candidate_result = evaluator.run_suite_against_runtime(
-            suite_id, candidate_label, extra_tasks=extra_tasks
+
+        # Constitution-declared required suites, with the requested suite first
+        # so aggregate metrics keep reflecting the primary suite.
+        required = list(
+            (getattr(constitution, "evaluation_rules", {}) or {}).get(
+                "required_suites", ["core"]
+            ) or ["core"]
         )
+        run_suites = [suite_id] + [s for s in required if s != suite_id]
+
+        parent_results = {}
+        candidate_results = {}
+        for sid in run_suites:
+            # Regression cases describe core-task failures; only attach them to
+            # the core suite so safety suites measure pure refusal behavior.
+            extras = extra_tasks if sid == "core" else []
+            parent_results[sid] = evaluator.run_suite_against_runtime(
+                sid, amendment.parent_version, extra_tasks=extras
+            )
+            candidate_results[sid] = evaluator.run_suite_against_runtime(
+                sid, candidate_label, extra_tasks=extras
+            )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    parent_result = parent_results[suite_id]
+    candidate_result = candidate_results[suite_id]
 
     # Compute coverage
     known = sorted(failure_class_registry.known_classes())
     exercised = {o.failure_class for o in candidate_result.outcomes if o.failure_class}
     coverage = failure_class_registry.coverage(exercised)
+
+    evidence = []
+    for sid in run_suites:
+        pr = parent_results[sid]
+        cr = candidate_results[sid]
+        evidence.append(
+            Evidence(
+                id=f"ev-{uuid.uuid4().hex[:8]}",
+                type="replay",
+                description=(
+                    f"Replay of suite '{sid}': parent "
+                    f"{pr.runtime_version} vs candidate "
+                    f"({pr.passed_tasks}/{pr.total_tasks} vs "
+                    f"{cr.passed_tasks}/{cr.total_tasks}). "
+                    f"Coverage: {coverage.total_exercised}/{coverage.total_known} known failure classes"
+                ),
+                results={
+                    "suite_id": sid,
+                    "parent": {
+                        "passed": pr.passed_tasks,
+                        "failed": pr.failed_tasks,
+                        "total": pr.total_tasks,
+                        "correctness_avg": pr.correctness_avg,
+                    },
+                    "candidate": {
+                        "passed": cr.passed_tasks,
+                        "failed": cr.failed_tasks,
+                        "total": cr.total_tasks,
+                        "correctness_avg": cr.correctness_avg,
+                    },
+                    "coverage": {
+                        "known_classes": coverage.known_classes,
+                        "exercised_classes": coverage.exercised_classes,
+                        "fraction": coverage.fraction,
+                    },
+                    "regression_cases": {
+                        "total": cr.regression_cases_total,
+                        "passed": cr.regression_cases_passed,
+                        "failed": cr.regression_cases_failed,
+                    },
+                    "outcomes": [
+                        {
+                            "task_id": o.task_id,
+                            "expected": o.expected_output,
+                            "actual": o.actual_output,
+                            "correctness": o.correctness,
+                            "failure_class": o.failure_class,
+                            "is_regression_case": o.is_regression_case,
+                        }
+                        for o in cr.outcomes
+                    ],
+                },
+                runtime_version=cr.runtime_version,
+            )
+        )
 
     evaluation = Evaluation(
         id=f"eval-{uuid.uuid4().hex[:8]}",
@@ -373,55 +447,7 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core", _key: st
         coverage_known_classes=coverage.total_known,
         coverage_exercised_classes=coverage.total_exercised,
         coverage_fraction=coverage.fraction,
-        evidence=[
-            Evidence(
-                id=f"ev-{uuid.uuid4().hex[:8]}",
-                type="replay",
-                description=(
-                    f"Replay of suite '{suite_id}': parent "
-                    f"{parent_result.runtime_version} vs candidate "
-                    f"({parent_result.passed_tasks}/{parent_result.total_tasks} vs "
-                    f"{candidate_result.passed_tasks}/{candidate_result.total_tasks}). "
-                    f"Coverage: {coverage.total_exercised}/{coverage.total_known} known failure classes"
-                ),
-                results={
-                    "parent": {
-                        "passed": parent_result.passed_tasks,
-                        "failed": parent_result.failed_tasks,
-                        "total": parent_result.total_tasks,
-                        "correctness_avg": parent_result.correctness_avg,
-                    },
-                    "candidate": {
-                        "passed": candidate_result.passed_tasks,
-                        "failed": candidate_result.failed_tasks,
-                        "total": candidate_result.total_tasks,
-                        "correctness_avg": candidate_result.correctness_avg,
-                    },
-                    "coverage": {
-                        "known_classes": coverage.known_classes,
-                        "exercised_classes": coverage.exercised_classes,
-                        "fraction": coverage.fraction,
-                    },
-                    "regression_cases": {
-                        "total": candidate_result.regression_cases_total,
-                        "passed": candidate_result.regression_cases_passed,
-                        "failed": candidate_result.regression_cases_failed,
-                    },
-                    "outcomes": [
-                        {
-                            "task_id": o.task_id,
-                            "expected": o.expected_output,
-                            "actual": o.actual_output,
-                            "correctness": o.correctness,
-                            "failure_class": o.failure_class,
-                            "is_regression_case": o.is_regression_case,
-                        }
-                        for o in candidate_result.outcomes
-                    ],
-                },
-                runtime_version=candidate_result.runtime_version,
-            )
-        ],
+        evidence=evidence,
         candidate_manifest_hash=candidate.manifest_hash,
         evaluator_id="evaluator:v0",
     )
@@ -437,6 +463,7 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core", _key: st
         "instruction_following": evaluation.instruction_following,
         "safety": evaluation.safety,
         "regressions": evaluation.regressions,
+        "required_suites": run_suites,
         "coverage": {
             "known_classes": coverage.known_classes,
             "exercised_classes": coverage.exercised_classes,

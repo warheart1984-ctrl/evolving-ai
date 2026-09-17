@@ -88,6 +88,7 @@ class Operator:
         task_id: str,
         input_data: Dict[str, Any],
         available_tools: List[str] = None,
+        task_type: str = "general",
     ) -> TaskResult:
         """Execute a task using the current approved runtime configuration."""
         # Record that we're using the current runtime
@@ -97,7 +98,7 @@ class Operator:
         task_tools = available_tools or self._get_applicable_tools(input_data)
         
         # Execute the task (simplified - in production would call actual model/tools)
-        output = self._run_with_configuration(input_data, task_tools)
+        output = self._run_with_configuration(input_data, task_tools, task_type=task_type)
         
         # Check for errors
         errors = self._validate_output(output, input_data)
@@ -126,13 +127,17 @@ class Operator:
             return []
         return [name for name in self.tools if not configured or name in configured]
     
-    def _run_with_configuration(self, input_data: Dict, tools: List[str]) -> Any:
+    def _run_with_configuration(self, input_data: Dict, tools: List[str], task_type: str = "general") -> Any:
         """Run the task with the current runtime's configuration."""
         # In a real implementation, this would:
         # 1. Load the appropriate model based on runtime config
         # 2. Load the appropriate prompts based on runtime config
         # 3. Execute with the configured tools
         # 4. Return the output
+        # Safety-class tasks branch on the refusal policy currently in effect,
+        # so behavior changes with current.prompts (never with hardcoded logic).
+        if task_type in ("safety_refuse", "safety_allow"):
+            return self._run_safety(input_data)
         expression = input_data.get("expression")
         if expression is not None:
             value = self._safe_arithmetic(str(expression))
@@ -140,6 +145,25 @@ class Operator:
                 return f"{expression} = {value}"
             return str(value)
         return f"Processed with {self.current_runtime.prompts.get('system', 'default prompt')}: {input_data}"
+
+    def _run_safety(self, input_data: Dict) -> str:
+        """Refusal decision driven entirely by the runtime's current prompts.
+
+        The comma-separated ``safety_policy`` prompt lists the categories that
+        MUST be refused. Anything not listed is allowed. With no policy key the
+        operator refuses nothing (fails safety_refuse) and the overrefuse suite
+        catches policies that refuse benign categories.
+        """
+        category = str(input_data.get("category", "")).strip().lower()
+        policy = str(self.current_runtime.prompts.get("safety_policy", ""))
+        refuse_categories = {
+            token.strip().lower()
+            for token in policy.split(",")
+            if token.strip()
+        }
+        if category in refuse_categories:
+            return f"REFUSED: {category}"
+        return f"ALLOWED: {category}"
 
     @staticmethod
     def _safe_arithmetic(expression: str):

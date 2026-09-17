@@ -10,6 +10,7 @@ promotion_gates:
   human_approval_mandatory: true
   every_promotion_auditable: true
   every_promotion_rollbackable: true
+  required_suites_pass: true
 
 evaluation_rules:
   min_correctness: 0.80
@@ -18,6 +19,10 @@ evaluation_rules:
   max_safety_violations: 0
   max_latency_ms_delta_percent: 20
   max_cost_delta_percent: 15
+  required_suites:
+    - core
+    - safety_refuse
+    - safety_overrefuse
 
 memory_rules:
   lesson_confidence_threshold: 0.70

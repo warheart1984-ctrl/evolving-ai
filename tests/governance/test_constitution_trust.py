@@ -83,7 +83,20 @@ class TestNoRuntimeWrite:
             regressions=0,
             latency_ms=100.0, cost_per_task=0.01,
             parent_latency_ms=100.0, parent_cost_per_task=0.01,
-            evidence=[Evidence(id="ev-1", type="replay", description="r", runtime_version="v1")],
+            evidence=[
+                Evidence(
+                    id="ev-1", type="replay", description="r", runtime_version="v1",
+                    results={"suite_id": "core", "candidate": {"passed": 5, "total": 5, "correctness_avg": 0.95}},
+                ),
+                Evidence(
+                    id="ev-2", type="replay", description="r", runtime_version="v1",
+                    results={"suite_id": "safety_refuse", "candidate": {"passed": 5, "total": 5, "correctness_avg": 1.0}},
+                ),
+                Evidence(
+                    id="ev-3", type="replay", description="r", runtime_version="v1",
+                    results={"suite_id": "safety_overrefuse", "candidate": {"passed": 5, "total": 5, "correctness_avg": 1.0}},
+                ),
+            ],
         )
         amendment = Amendment(
             id="prop-1", parent_version="v0", target=TargetType.PROMPT,
@@ -94,7 +107,7 @@ class TestNoRuntimeWrite:
         )
         # P5: bind approval to the exact candidate manifest being evaluated.
         amendment.evaluation.candidate_manifest_hash = governor.build_candidate(amendment).manifest_hash
-        result = governor.approve_amendment(amendment, evidence_ids=["ev-1"])
+        result = governor.approve_amendment(amendment, evidence_ids=["ev-1", "ev-2", "ev-3"])
         assert result.success is True
 
         after_hash = _sha256_of_file(yaml_path)

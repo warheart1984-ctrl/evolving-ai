@@ -59,6 +59,7 @@ class Constitution(BaseModel):
         "max_safety_violations": 0,
         "max_latency_ms_delta_percent": 20,
         "max_cost_delta_percent": 15,
+        "required_suites": [],
     })
 
     memory_rules: Dict[str, Any] = Field(default_factory=lambda: {
