@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Governor Dashboard — Evolving AI Runtime</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Consolas, monospace; background: #0d1117; color: #c9d1d9; padding: 24px; }
+  h1 { color: #58a6ff; font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #8b949e; font-size: 12px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+  .card h2 { font-size: 13px; color: #58a6ff; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: 11px; color: #a5d6ff; }
+  .kv { font-size: 12px; margin: 2px 0; }
+  .kv b { color: #79c0ff; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; margin: 1px; }
+  .proposed { background: #1f3a1f; color: #7ee787; }
+  .review { background: #3a2f1f; color: #f2cc60; }
+  .approved, .promoted { background: #1f2a3a; color: #58a6ff; }
+  .rejected, .reverted { background: #3a1f1f; color: #f85149; }
+  button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+           padding: 4px 10px; font-family: inherit; font-size: 11px; cursor: pointer; margin: 2px 2px 2px 0; }
+  button.approve { border-color: #2ea04366; color: #7ee787; }
+  button.reject { border-color: #f8514966; color: #f85149; }
+  button:hover { background: #30363d; }
+  .empty { color: #8b949e; font-style: italic; font-size: 12px; }
+  .muted { color: #8b949e; }
+</style>
+</head>
+<body>
+<h1>Governor Dashboard</h1>
+<div class="sub">Nothing evolves in place. Every change is a versioned amendment that must be evaluated and approved before promotion.</div>
+<div class="grid">
+  <div class="card"><h2>Current Runtime</h2><div id="current" class="empty">loading…</div></div>
+  <div class="card"><h2>Pending Amendments</h2><div id="amendments" class="empty">loading…</div></div>
+  <div class="card"><h2>Runtime History</h2><div id="history" class="empty">loading…</div></div>
+  <div class="card"><h2>Evaluation Results</h2><div id="evals" class="empty">no evaluations yet</div></div>
+  <div class="card"><h2>Failure Telemetry</h2><div id="telemetry" class="empty">loading…</div></div>
+  <div class="card"><h2>Audit Trail</h2><div id="audit" class="empty">no governance actions yet</div></div>
+</div>
+<div style="margin-top:16px">
+  <button onclick="refresh()">↻ Refresh</button>
+  <button onclick="rollbackTo(prompt('Rollback to version (e.g. v0):'))">⏪ Rollback</button>
+  <button onclick="analyze()">🧠 Run Steward Loop</button>
+</div>
+
+<script>
+const api = (path, opts) => fetch(path, opts).then(r => r.json().then(j => ({ ok: r.ok, body: j })));
+const kv = (k, v) => `<div class="kv"><b>${k}:</b> ${v ?? '—'}</div>`;
+let clientAudit = [];
+
+async function refresh() {
+  const cur = await api('/runtime/current');
+  document.getElementById('current').innerHTML = cur.ok ? `
+    ${kv('version', cur.body.version)}${kv('model', cur.body.model_identifier)}
+    ${kv('constitution', cur.body.constitution_version)}${kv('parent', cur.body.parent_version)}
+    ${kv('prompts', Object.entries(cur.body.prompts || {}).map(([k, v]) => `${k}:${v}`).join(', ') || '—')}` : 'none';
+
+  const amds = await api('/amendments');
+  document.getElementById('amendments').innerHTML = amds.ok && amds.body.length ?
+    amds.body.map(a => `
+      <div class="kv"><span class="pill ${a.status}">${a.status}</span> <b>${a.id}</b></div>
+      <div class="kv muted">${a.description}</div>
+      <div class="kv muted">target: ${a.target} · parent: ${a.parent_version} · proposer: ${a.proposer}</div>
+      ${a.evaluation ? `<div class="kv">eval: correctness=${a.evaluation.correctness} safety=${a.evaluation.safety} regressions=${a.evaluation.regressions}</div>` : ''}
+      <button class="approve" onclick="decide('${a.id}', 'approve')">✓ Approve</button>
+      <button class="reject" onclick="decide('${a.id}', 'reject')">✗ Reject</button>
+      <hr style="border-color:#21262d;margin:8px 0">`).join('') : 'no amendments';
+
+  const list = await api('/runtime/list');
+  document.getElementById('history').innerHTML = list.ok ?
+    list.body.map(r => `${kv(r.version, `${r.description} <span class="muted">(${r.created_by})</span>`)}`).join('') : 'none';
+
+  const evals = amds.ok ? amds.body.filter(a => a.evaluation) : [];
+  document.getElementById('evals').innerHTML = evals.length ? evals.map(a => {
+    const ev = a.evaluation.evidence && a.evaluation.evidence[0];
+    const out = ev && ev.results && ev.results.outcomes;
+    return `${kv(a.id, `correctness=${a.evaluation.correctness} · safety=${a.evaluation.safety} · regressions=${a.evaluation.regressions}`)}
+      ${ev ? `<div class="kv muted">${ev.description}</div>` : ''}
+      ${out ? out.map(o => `<div class="kv muted">· ${o.task_id}: expected=${JSON.stringify(o.expected)} actual=${JSON.stringify(o.actual)} (correctness=${o.correctness})</div>`).join('') : ''}`;
+  }).join('<hr style="border-color:#21262d;margin:8px 0">') : 'no evaluations yet';
+
+  const tel = await api('/telemetry/failures');
+  document.getElementById('telemetry').innerHTML = tel.ok && tel.body.length ?
+    tel.body.map(r => `${kv(r.run_id, `task=${r.task_id} · ${r.errors.join('; ') || 'failed'}`)}`).join('') : 'no failures recorded';
+
+  const audit = await api('/governance/audit');
+  const entries = audit.ok ? audit.body.entries.concat(clientAudit) : clientAudit;
+  document.getElementById('audit').innerHTML = entries.length ?
+    entries.map(e => `${kv(e.timestamp, `${e.action} → ${e.to_runtime || e.reason || ''} ${e.amendment_id ? `(amendment ${e.amendment_id})` : ''}`)}`).join('') : 'no governance actions yet';
+}
+
+async function decide(id, action) {
+  const res = await api(`/governance/${action}/${id}`, { method: 'POST' });
+  clientAudit.push({ timestamp: new Date().toISOString(), action: res.body.status || action,
+                     to_runtime: res.body.new_runtime_id, reason: res.body.reason, amendment_id: id });
+  refresh();
+}
+
+async function rollbackTo(version) {
+  if (!version) return;
+  await api(`/runtime/rollback/${version}`, { method: 'POST' });
+  clientAudit.push({ timestamp: new Date().toISOString(), action: 'rollback', to_runtime: 'runtime-' + version });
+  refresh();
+}
+
+async function analyze() {
+  await api('/steward/analyze', { method: 'POST' });
+  refresh();
+}
+
+refresh();
+</script>
+</body>
+</html>

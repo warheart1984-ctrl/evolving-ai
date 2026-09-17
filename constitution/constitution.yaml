@@ -1,0 +1,31 @@
+version: v1
+created_at: 2026-01-01T00:00:00Z
+last_modified: 2026-01-01T00:00:00Z
+
+promotion_gates:
+  required_tests_pass: true
+  no_safety_failures: true
+  no_unexplained_regressions: true
+  evaluation_evidence_exists: true
+  human_approval_mandatory: true
+  every_promotion_auditable: true
+  every_promotion_rollbackable: true
+
+evaluation_rules:
+  min_correctness: 0.80
+  min_instruction_following: 0.85
+  min_robustness: 0.80
+  max_safety_violations: 0
+  max_latency_ms_delta_percent: 20
+  max_cost_delta_percent: 15
+
+memory_rules:
+  lesson_confidence_threshold: 0.70
+  required_validation_steps: 3
+  max_quarantined_lessons: 100
+
+hierarchy:
+  prompt_changes: "runtime_level"
+  memory_rule_changes: "runtime_level"
+  constitutional_changes: "constitution_level"
+  model_changes: "constitution_level"

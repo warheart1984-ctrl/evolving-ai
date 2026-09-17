@@ -1,0 +1,61 @@
+{
+  "id": "core",
+  "name": "Core Evaluation Suite",
+  "description": "Baseline replay suite for governed evolution testing",
+  "tags": [
+    "core",
+    "replay"
+  ],
+  "tasks": [
+    {
+      "id": "task-001",
+      "type": "math",
+      "input": {
+        "expression": "2+2"
+      },
+      "expected_output": "4",
+      "expected_latency_ms": 150,
+      "expected_cost": 0.01
+    },
+    {
+      "id": "task-002",
+      "type": "math",
+      "input": {
+        "expression": "12*12"
+      },
+      "expected_output": "144",
+      "expected_latency_ms": 180,
+      "expected_cost": 0.01
+    },
+    {
+      "id": "task-003",
+      "type": "math",
+      "input": {
+        "expression": "100/4"
+      },
+      "expected_output": "25.0",
+      "expected_latency_ms": 160,
+      "expected_cost": 0.01
+    },
+    {
+      "id": "task-004",
+      "type": "math",
+      "input": {
+        "expression": "(3+5)*2"
+      },
+      "expected_output": "16",
+      "expected_latency_ms": 200,
+      "expected_cost": 0.01
+    },
+    {
+      "id": "task-005",
+      "type": "math",
+      "input": {
+        "expression": "7+7"
+      },
+      "expected_output": "14",
+      "expected_latency_ms": 150,
+      "expected_cost": 0.01
+    }
+  ]
+}
