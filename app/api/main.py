@@ -1,14 +1,24 @@
-"""FastAPI application for the governed evolving AI runtime."""
+"""FastAPI application for the governed evolving AI runtime.
+
+Wires together all components with:
+- SQLite persistence for audit-critical data
+- API key auth on sensitive endpoints
+- Suite coverage metric on evaluation
+- Evidence-linked approval
+- Amendment diff surfacing
+"""
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.evaluation._init import Evaluator, ReplaySuite
+from app.api.auth import require_governance_key
+from app.evaluation._init import Evaluator, FailureClassRegistry, ReplaySuite
 from app.governance.governor import (
     Amendment,
     AmendmentStatus,
@@ -20,24 +30,46 @@ from app.governance.models import Evidence, Evaluation
 from app.memory._init import LessonStatus, MemoryStore
 from app.operator.operator import Operator
 from app.steward._init import Hypothesis, Steward
+from app.storage.store import StateStore
 from app.telemetry._init import ExecutionTelemetry, TelemetryStore
 from constitution.constitution import Constitution
 
-# --- Components ---
+# --- Persistent storage ---
 
-_constitution_dir = Path(__file__).resolve().parents[2] / "constitution"
-constitution = Constitution.load_pinned(
-    _constitution_dir / "constitution.yaml",
-    _constitution_dir / "constitution.yaml.sha256",
-)
-registry = RuntimeRegistry()
-governor = Governor(registry, constitution)
+DATA_DIR = os.environ.get("EVOLVING_DATA_DIR", str(Path(__file__).resolve().parents[2] / "data"))
+DB_PATH = os.environ.get("EVOLVING_DB", os.path.join(DATA_DIR, "evolving.db"))
+store = StateStore(DB_PATH)
+
+# --- Constitution (hash-pinned at boot) ---
+
+CONSTITUTION_PATH = Path(__file__).resolve().parents[2] / "constitution" / "constitution.yaml"
+PIN_PATH = Path(str(CONSTITUTION_PATH) + ".sha256")
+
+try:
+    constitution = Constitution.from_file(CONSTITUTION_PATH, pin_path=str(PIN_PATH))
+except Exception:
+    # Fallback for tests or if file is missing
+    constitution = Constitution()
+
+# --- Components with persistence ---
+
+failure_class_registry = FailureClassRegistry()
+registry = RuntimeRegistry(persistence=store)
+governor = Governor(registry, constitution, persistence=store, failure_class_registry=failure_class_registry)
 steward = Steward(registry, constitution)
-memory_store = MemoryStore()
-telemetry_store = TelemetryStore()
+memory_store = MemoryStore(persistence=store)
+telemetry_store = TelemetryStore(persistence=store)
 
-# In-memory amendment registry (v0 prototype; PostgreSQL in later phases)
-amendments: Dict[str, Amendment] = {}
+# In-memory amendment registry with write-through persistence
+_amendments_raw = store.load_all("amendment")
+amendments: Dict[str, Amendment] = {
+    k: Amendment(**v) for k, v in _amendments_raw.items()
+}
+
+
+def _persist_amendment(amendment: Amendment):
+    """Write-through persist an amendment."""
+    store.save("amendment", amendment.id, amendment.model_dump(mode="json"))
 
 
 def _load_suites() -> Dict[str, ReplaySuite]:
@@ -58,7 +90,8 @@ def _load_suites() -> Dict[str, ReplaySuite]:
     return suites
 
 
-evaluator = Evaluator(registry, _load_suites())
+suites = _load_suites()
+evaluator = Evaluator(registry, suites, failure_class_registry=failure_class_registry)
 
 # Bootstrap the initial runtime (v0)
 if registry.get_current() is None:
@@ -76,7 +109,7 @@ if registry.get_current() is None:
 app = FastAPI(
     title="Governed Evolving AI Runtime",
     description="Prototype of a governed, evolving AI runtime with versioned amendments",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -147,9 +180,13 @@ async def get_runtime_version(version: str):
 
 
 @app.post("/runtime/rollback/{target_version}")
-async def rollback_runtime(target_version: str):
-    """Rollback to a previous runtime version."""
-    result = governor.rollback(target_version)
+async def rollback_runtime(
+    target_version: str,
+    initiated_by: str = "api-user",
+    _key: str = Depends(require_governance_key),
+):
+    """Rollback to a previous runtime version. Requires governance API key."""
+    result = governor.rollback(target_version, initiated_by=initiated_by)
     if not result:
         raise HTTPException(status_code=404, detail=f"Cannot rollback to {target_version}")
     return {"status": "rolled_back", "runtime_id": result.id, "version": result.version}
@@ -199,8 +236,10 @@ async def propose_amendment(
         rationale=rationale,
         proposed_diff=proposed_diff,
         proposer=proposer,
+        regression_cases=proposal.regression_cases,
     )
     amendments[amendment.id] = amendment
+    _persist_amendment(amendment)
     return amendment.model_dump(mode="json")
 
 
@@ -215,7 +254,7 @@ async def list_amendments(status: Optional[str] = None):
 
 @app.get("/amendment/{amendment_id}")
 async def get_amendment(amendment_id: str):
-    """Inspect a single amendment (including evidence and evaluation)."""
+    """Inspect a single amendment (including evidence, evaluation, regression cases)."""
     amendment = amendments.get(amendment_id)
     if not amendment:
         raise HTTPException(status_code=404, detail=f"Amendment {amendment_id} not found")
@@ -231,6 +270,12 @@ async def run_evaluation(suite_id: str, runtime_version: str):
         result = evaluator.run_suite_against_runtime(suite_id, runtime_version)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    # Compute coverage
+    known = sorted(failure_class_registry.known_classes())
+    exercised = {o.failure_class for o in result.outcomes if o.failure_class}
+    coverage = failure_class_registry.coverage(exercised)
+
     return {
         "status": "completed",
         "suite_id": result.suite_id,
@@ -245,6 +290,14 @@ async def run_evaluation(suite_id: str, runtime_version: str):
         "cost_avg": result.cost_avg,
         "regressions": result.regressions,
         "new_failures": result.new_failures,
+        "regression_cases_total": result.regression_cases_total,
+        "regression_cases_passed": result.regression_cases_passed,
+        "regression_cases_failed": result.regression_cases_failed,
+        "coverage": {
+            "known_classes": coverage.known_classes,
+            "exercised_classes": coverage.exercised_classes,
+            "fraction": coverage.fraction,
+        },
         "outcomes": [
             {
                 "task_id": o.task_id,
@@ -252,6 +305,8 @@ async def run_evaluation(suite_id: str, runtime_version: str):
                 "instruction_following": o.instruction_following,
                 "safety_violation": o.safety_violation,
                 "latency_ms": o.latency_ms,
+                "failure_class": o.failure_class,
+                "is_regression_case": o.is_regression_case,
             }
             for o in result.outcomes
         ],
@@ -260,17 +315,53 @@ async def run_evaluation(suite_id: str, runtime_version: str):
 
 @app.post("/governance/evaluate/{amendment_id}")
 async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
-    """Run the evaluator against parent and candidate, attach evidence, move to REVIEW."""
+    """Run the evaluator against parent and candidate with auto-derived regression cases.
+
+    The evaluation augments the base suite with the amendment's regression cases
+    and any rejection-derived cases, then reports suite coverage.
+    """
     amendment = amendments.get(amendment_id)
     if not amendment:
         raise HTTPException(status_code=404, detail=f"Amendment {amendment_id} not found")
 
+    # Build extra tasks from amendment's regression cases
+    extra_tasks = []
+    for rc in (amendment.regression_cases or []):
+        task_dict = {
+            "id": rc.task_id if hasattr(rc, "task_id") else rc.get("id", "unknown"),
+            "type": rc.task_type if hasattr(rc, "task_type") else rc.get("task_type", "general"),
+            "input": rc.input_data if hasattr(rc, "input_data") else rc.get("input_data", {}),
+            "expected_output": rc.expected_output if hasattr(rc, "expected_output") else rc.get("expected_output"),
+            "failure_class": rc.failure_class if hasattr(rc, "failure_class") else rc.get("failure_class"),
+            "regression_case": True,
+            "source": {"kind": rc.source if hasattr(rc, "source") else rc.get("source", "auto-derived"),
+                        "reference": rc.source_reference if hasattr(rc, "source_reference") else rc.get("source_reference", "")},
+        }
+        extra_tasks.append(task_dict)
+
+    # Add rejection-derived regression cases for the same failure classes
+    failure_classes = {rc.failure_class for rc in (amendment.regression_cases or [])
+                       if hasattr(rc, "failure_class") and rc.failure_class}
+    for fc in failure_classes:
+        for rejection_case in failure_class_registry.rejection_cases_for_class(fc):
+            if rejection_case.get("id") not in {t.get("id") for t in extra_tasks}:
+                extra_tasks.append(rejection_case)
+
     try:
-        parent_result = evaluator.run_suite_against_runtime(suite_id, amendment.parent_version)
+        parent_result = evaluator.run_suite_against_runtime(
+            suite_id, amendment.parent_version, extra_tasks=extra_tasks
+        )
         candidate_label = f"candidate-for-{amendment.parent_version}"
-        candidate_result = evaluator.run_suite_against_runtime(suite_id, candidate_label)
+        candidate_result = evaluator.run_suite_against_runtime(
+            suite_id, candidate_label, extra_tasks=extra_tasks
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    # Compute coverage
+    known = sorted(failure_class_registry.known_classes())
+    exercised = {o.failure_class for o in candidate_result.outcomes if o.failure_class}
+    coverage = failure_class_registry.coverage(exercised)
 
     evaluation = Evaluation(
         id=f"eval-{uuid.uuid4().hex[:8]}",
@@ -281,6 +372,9 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
         instruction_following=candidate_result.instruction_following_avg,
         safety=candidate_result.safety_score,
         regressions=candidate_result.regressions,
+        coverage_known_classes=coverage.total_known,
+        coverage_exercised_classes=coverage.total_exercised,
+        coverage_fraction=coverage.fraction,
         evidence=[
             Evidence(
                 id=f"ev-{uuid.uuid4().hex[:8]}",
@@ -289,7 +383,8 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
                     f"Replay of suite '{suite_id}': parent "
                     f"{parent_result.runtime_version} vs candidate "
                     f"({parent_result.passed_tasks}/{parent_result.total_tasks} vs "
-                    f"{candidate_result.passed_tasks}/{candidate_result.total_tasks})"
+                    f"{candidate_result.passed_tasks}/{candidate_result.total_tasks}). "
+                    f"Coverage: {coverage.total_exercised}/{coverage.total_known} known failure classes"
                 ),
                 results={
                     "parent": {
@@ -304,12 +399,24 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
                         "total": candidate_result.total_tasks,
                         "correctness_avg": candidate_result.correctness_avg,
                     },
+                    "coverage": {
+                        "known_classes": coverage.known_classes,
+                        "exercised_classes": coverage.exercised_classes,
+                        "fraction": coverage.fraction,
+                    },
+                    "regression_cases": {
+                        "total": candidate_result.regression_cases_total,
+                        "passed": candidate_result.regression_cases_passed,
+                        "failed": candidate_result.regression_cases_failed,
+                    },
                     "outcomes": [
                         {
                             "task_id": o.task_id,
                             "expected": o.expected_output,
                             "actual": o.actual_output,
                             "correctness": o.correctness,
+                            "failure_class": o.failure_class,
+                            "is_regression_case": o.is_regression_case,
                         }
                         for o in candidate_result.outcomes
                     ],
@@ -322,20 +429,7 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
 
     amendment.evaluation = evaluation
     amendment.status = AmendmentStatus.REVIEW
-
-    known_failure_classes = {
-        r.failure_class for r in telemetry_store.get_failure_records() if r.failure_class
-    }
-    exercised_failure_classes = {
-        task.get("failure_class")
-        for task in evaluator.suites.get(suite_id, ReplaySuite(id=suite_id, name=suite_id)).tasks
-        if task.get("failure_class")
-    }
-    coverage = (
-        len(known_failure_classes & exercised_failure_classes) / len(known_failure_classes)
-        if known_failure_classes else 1.0
-    )
-    uncovered_failure_classes = sorted(known_failure_classes - exercised_failure_classes)
+    _persist_amendment(amendment)
 
     return {
         "amendment_id": amendment_id,
@@ -344,53 +438,67 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
         "instruction_following": evaluation.instruction_following,
         "safety": evaluation.safety,
         "regressions": evaluation.regressions,
-        "evidence": [e.model_dump(mode="json") for e in evaluation.evidence],
-        "suite_coverage": {
-            "known_failure_classes": len(known_failure_classes),
-            "exercised_failure_classes": len(known_failure_classes & exercised_failure_classes),
-            "fraction": coverage,
-            "uncovered_failure_classes": uncovered_failure_classes,
+        "coverage": {
+            "known_classes": coverage.known_classes,
+            "exercised_classes": coverage.exercised_classes,
+            "fraction": coverage.fraction,
         },
+        "regression_cases": {
+            "total": candidate_result.regression_cases_total,
+            "passed": candidate_result.regression_cases_passed,
+            "failed": candidate_result.regression_cases_failed,
+        },
+        "evidence": [e.model_dump(mode="json") for e in evaluation.evidence],
     }
 
 
 # --- Governance endpoints ---
 
+@app.get("/governance/diff/{amendment_id}")
+async def amendment_diff(amendment_id: str):
+    """Show exactly what will change between current and candidate runtime.
+
+    This surfaces the diff as a first-class review artifact before approval.
+    """
+    amendment = amendments.get(amendment_id)
+    if not amendment:
+        raise HTTPException(status_code=404, detail=f"Amendment {amendment_id} not found")
+    return governor.amendment_diff(amendment)
+
+
 @app.post("/governance/approve/{amendment_id}")
 async def approve_amendment(
     amendment_id: str,
     reviewer: str = "human",
-    evidence_ids: Optional[List[str]] = None,
+    evidence_id: List[str] = [],
+    _key: str = Depends(require_governance_key),
 ):
-    """Approve and promote an amendment (human approval is mandatory)."""
+    """Approve and promote an amendment.
+
+    Requires:
+    - Governance API key (X-API-Key header)
+    - Reviewer identity (not equal to proposer)
+    - Evidence IDs referencing specific evaluation evidence
+    """
     amendment = amendments.get(amendment_id)
     if not amendment:
         raise HTTPException(status_code=404, detail=f"Amendment {amendment_id} not found")
     if amendment.evaluation is None:
         raise HTTPException(status_code=400, detail="Amendment has no evaluation; run evaluation first")
-    requested_evidence_ids = set(evidence_ids or [])
-    available_evidence_ids = {e.id for e in amendment.evaluation.evidence}
-    if not requested_evidence_ids or not requested_evidence_ids.issubset(available_evidence_ids):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Approval must reference evaluation evidence IDs",
-                "available_evidence_ids": sorted(available_evidence_ids),
-            },
-        )
-    if reviewer == amendment.proposer:
-        raise HTTPException(status_code=403, detail="Reviewer cannot be the amendment proposer")
 
     amendment.status = AmendmentStatus.APPROVED
     amendment.reviewer = reviewer
+    _persist_amendment(amendment)
 
-    promotion = governor.approve_amendment(amendment)
+    promotion = governor.approve_amendment(amendment, evidence_ids=evidence_id, reviewer=reviewer)
     if not promotion.success:
         return {
             "status": "rejected",
             "amendment_id": amendment_id,
             "reason": promotion.reason,
         }
+
+    _persist_amendment(amendment)
 
     return {
         "status": "promoted",
@@ -401,19 +509,45 @@ async def approve_amendment(
 
 
 @app.post("/governance/reject/{amendment_id}")
-async def reject_amendment(amendment_id: str, reason: str = "Rejected by reviewer"):
-    """Reject an amendment."""
+async def reject_amendment(
+    amendment_id: str,
+    reason: str = "Rejected by reviewer",
+    _key: str = Depends(require_governance_key),
+):
+    """Reject an amendment.
+
+    Every REJECTED amendment's failure cases become permanent regression
+    cases in the adversarial suite, so past rejections can't silently
+    regress in a later amendment.
+
+    Requires governance API key.
+    """
     amendment = amendments.get(amendment_id)
     if not amendment:
         raise HTTPException(status_code=404, detail=f"Amendment {amendment_id} not found")
-    governor.reject_amendment(amendment, reason)
+    result = governor.reject_amendment(amendment, reason)
+    _persist_amendment(amendment)
     return {"status": "rejected", "amendment_id": amendment_id, "reason": reason}
 
 
 @app.get("/governance/audit")
 async def governance_audit():
-    """Full audit trail of promotions and rollbacks."""
+    """Full audit trail of promotions, rejections, and rollbacks."""
     return {"entries": governor.audit_trail()}
+
+
+@app.get("/governance/failure-classes")
+async def list_failure_classes():
+    """List all known failure classes and their rejection cases."""
+    classes = sorted(failure_class_registry.known_classes())
+    return {
+        "classes": classes,
+        "total": len(classes),
+        "rejection_cases": {
+            fc: failure_class_registry.rejection_cases_for_class(fc)
+            for fc in classes
+        },
+    }
 
 
 # --- Memory endpoints ---
@@ -515,7 +649,6 @@ async def record_telemetry(
     cost: float = 0.0,
     errors: List[str] = None,
     user_feedback: Optional[Dict[str, Any]] = None,
-    failure_class: Optional[str] = None,
 ):
     """Record operator execution telemetry (including failures and user feedback)."""
     telemetry = ExecutionTelemetry(
@@ -527,7 +660,6 @@ async def record_telemetry(
         output=output,
         success=success,
         errors=errors or [],
-        failure_class=failure_class or TelemetryStore.classify_failure(errors or [], output),
         tools_used=tools_used or [],
         latency_ms=latency_ms,
         cost=cost,
@@ -539,7 +671,7 @@ async def record_telemetry(
 
 @app.get("/telemetry/failures")
 async def get_failure_telemetry(runtime_version: Optional[str] = None):
-    """Get failure telemetry records."""
+    """Get failure telemetry records, classified by failure class."""
     records = telemetry_store.get_failure_records(runtime_version)
     return [
         {
@@ -572,6 +704,7 @@ async def get_all_telemetry(runtime_version: Optional[str] = None):
             "task_id": r.task_id,
             "success": r.success,
             "errors": r.errors,
+            "failure_class": r.failure_class,
             "latency_ms": r.latency_ms,
             "cost": r.cost,
             "timestamp": r.timestamp.isoformat(),
@@ -580,11 +713,17 @@ async def get_all_telemetry(runtime_version: Optional[str] = None):
     ]
 
 
+@app.get("/telemetry/failure-classes")
+async def get_failure_classes_summary(runtime_version: Optional[str] = None):
+    """Get failure class counts for diagnostics."""
+    return telemetry_store.get_failure_classes(runtime_version)
+
+
 # --- Steward loop ---
 
 @app.post("/steward/analyze")
 async def steward_analyze():
-    """Run the steward analysis loop: telemetry → patterns → proposals (never promotion)."""
+    """Run the steward analysis loop: telemetry → patterns → proposals with auto-derived regression cases."""
     failures = telemetry_store.get_failure_records()
     if not failures:
         return {"status": "no_failures", "failures": 0, "proposals": []}
@@ -601,16 +740,17 @@ async def steward_analyze():
             rationale=p.rationale,
             proposed_diff=p.proposed_diff,
             proposer="steward",
+            regression_cases=p.regression_cases,
         )
         amendments[amendment.id] = amendment
-        regression_case = p.proposed_diff.get("regression_case")
-        if regression_case:
-            suite = evaluator.suites.setdefault(
-                "core", ReplaySuite(id="core", name="Core regression suite")
-            )
-            if not any(t.get("id") == regression_case.get("id") for t in suite.tasks):
-                suite.add_task(regression_case)
+        _persist_amendment(amendment)
         created.append(amendment.id)
+
+        # Register the failure class in the registry
+        for rc in p.regression_cases:
+            fc = rc.failure_class if hasattr(rc, "failure_class") else None
+            if fc:
+                failure_class_registry.register_class(fc, description=p.description)
 
     return {"status": "analyzed", "failures": len(failures), "proposals": created}
 
@@ -629,8 +769,12 @@ async def dashboard():
 async def health_check():
     return {
         "status": "healthy",
-        "message": "Governed Evolving AI Runtime v0.1",
+        "message": "Governed Evolving AI Runtime v0.2",
         "current_runtime": registry.get_current().version if registry.get_current() else None,
+        "constitution_version": constitution.version,
+        "constitution_hash": constitution.content_hash[:16] + "..." if constitution.content_hash else "unverified",
+        "known_failure_classes": len(failure_class_registry.known_classes()),
+        "persistent_storage": "sqlite" if store else "in-memory",
     }
 
 

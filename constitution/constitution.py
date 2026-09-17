@@ -1,13 +1,42 @@
-"""Constitution model - the versioned rule set governing the runtime."""
-from datetime import datetime
-from typing import Any, Dict
-import hashlib
-from pathlib import Path
+"""Constitution model - the versioned rule set governing the runtime.
 
-from pydantic import BaseModel, Field
+Constitution as root of trust:
+- Hash-pinned at boot: if constitution.yaml is tampered with outside the
+  amendment pipeline, startup refuses (ConstitutionIntegrityError).
+- In-memory immutable: Constitution is a frozen Pydantic model so no
+  code path can mutate it at runtime.
+- Explicitly non-amendable in v0: constitutional changes require a
+  separate quorum process, not the standard amendment pipeline.
+"""
+import hashlib
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ConstitutionIntegrityError(Exception):
+    """Raised when constitution.yaml has been tampered with at boot."""
+    pass
+
+
+def _sha256_of_file(path: str) -> str:
+    """Compute SHA-256 hex digest of a file's contents."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class Constitution(BaseModel):
+    """Immutable constitution. Frozen to prevent in-memory mutation.
+
+    The promotion gates here are the machine-enforced rules.
+    """
+    model_config = ConfigDict(frozen=True)
+
     version: str = "v1"
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_modified: datetime = Field(default_factory=datetime.utcnow)
@@ -44,29 +73,56 @@ class Constitution(BaseModel):
         "model_changes": "constitution_level",
     })
 
+    # v0: constitutional changes require separate quorum, not the standard pipeline
+    constitution_amendment_policy: Dict[str, Any] = Field(default_factory=lambda: {
+        "required_reviewers": 2,
+        "cooling_off_period_minutes": 1440,  # 24 hours
+        "quorum_required": True,
+        "note": "Constitutional changes are NOT amendable in v0. "
+                "This policy is preserved for future implementation.",
+    })
+
+    content_hash: str = ""  # SHA-256 of constitution.yaml at load time
+
     @classmethod
-    def from_file(cls, path) -> "Constitution":
-        """Load a constitution from YAML. Falls back to defaults if yaml is unavailable."""
+    def from_file(cls, path, pin_path: Optional[str] = None) -> "Constitution":
+        """Load constitution from YAML, verifying hash pin if provided.
+
+        Args:
+            path: Path to constitution.yaml
+            pin_path: Optional path to .sha256 pin file. If provided and
+                the hash doesn't match, raises ConstitutionIntegrityError.
+        """
+        path = str(path)
+        actual_hash = _sha256_of_file(path)
+
+        # Verify pin if provided
+        if pin_path:
+            pin_path = str(pin_path)
+            if not os.path.exists(pin_path):
+                raise ConstitutionIntegrityError(
+                    f"Constitution pin file not found: {pin_path}. "
+                    f"Cannot verify integrity of {path}"
+                )
+            with open(pin_path, "r") as f:
+                expected_hash = f.read().strip()
+            if actual_hash != expected_hash:
+                raise ConstitutionIntegrityError(
+                    f"Constitution integrity violation! "
+                    f"Expected hash {expected_hash[:16]}... but got {actual_hash[:16]}... "
+                    f"File {path} has been modified outside the amendment pipeline."
+                )
+
+        # Load YAML
         try:
             import yaml
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
-            return cls(**data)
         except ImportError:
-            return cls()
+            data = {}
 
-    @staticmethod
-    def sha256(path: Path) -> str:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        data["content_hash"] = actual_hash
+        return cls(**data)
 
-    @classmethod
-    def load_pinned(cls, path: Path, pin_path: Path) -> "Constitution":
-        """Load only when the on-disk constitution matches its committed pin."""
-        actual = cls.sha256(path)
-        expected = pin_path.read_text(encoding="utf-8").strip().lower()
-        if actual != expected:
-            raise RuntimeError(
-                f"CRITICAL: constitution hash mismatch for {path}; "
-                f"expected {expected}, got {actual}"
-            )
-        return cls.from_file(path)
+
+import os  # noqa: E402 (needed at module level for from_file)

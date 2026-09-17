@@ -1,16 +1,21 @@
-"""Steward: analyzes failures and proposes amendments. Cannot promote."""
+"""Steward: analyzes failures, proposes amendments with auto-derived
+regression cases, and rate-limits proposals per failure class.
+
+Cannot promote: creative but not authoritative."""
+import hashlib
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from app.governance.models import AmendmentStatus, TargetType
+from app.governance.models import AmendmentStatus, RegressionCase, TargetType
 from app.governance.registry import RuntimeRegistry
 
 
 class FailurePattern(BaseModel):
     """A detected failure pattern from telemetry."""
     id: str
+    failure_class: str
     description: str
     frequency: int
     affected_tasks: List[str] = Field(default_factory=list)
@@ -18,8 +23,7 @@ class FailurePattern(BaseModel):
     first_seen: datetime = Field(default_factory=datetime.utcnow)
     last_seen: datetime = Field(default_factory=datetime.utcnow)
     runtime_versions_affected: List[str] = Field(default_factory=list)
-    failure_class: str = "unknown"
-    regression_case: Dict[str, Any] = Field(default_factory=dict)
+    sample_inputs: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class Hypothesis(BaseModel):
@@ -31,10 +35,11 @@ class Hypothesis(BaseModel):
     rationale: str = ""
     supporting_evidence: List[str] = Field(default_factory=list)
     confidence: float = 0.5  # 0.0 to 1.0
+    failure_class: str = ""
 
 
 class AmendmentProposal(BaseModel):
-    """A steward-generated amendment proposal."""
+    """A steward-generated amendment proposal with auto-derived regression cases."""
     id: str
     parent_version: str
 
@@ -45,6 +50,9 @@ class AmendmentProposal(BaseModel):
     proposed_diff: Dict[str, Any]
 
     hypotheses: List[Hypothesis] = Field(default_factory=list)
+
+    # Auto-derived regression cases that reproduce the exact failures being fixed
+    regression_cases: List[RegressionCase] = Field(default_factory=list)
 
     evidence: List[Any] = Field(default_factory=list)
     evaluation: Optional[Any] = None
@@ -65,18 +73,68 @@ class Steward:
 
     The Steward is creative but not authoritative: it can propose changes,
     but it cannot unilaterally enact them.
+
+    Each proposal includes auto-derived regression cases that reproduce
+    the exact failures being addressed, so the evaluator tests against
+    real failures rather than relying on hand-authored suites.
     """
 
     MIN_FAILURE_FREQUENCY = 3
+    RATE_LIMIT_WINDOW_SECONDS = 3600.0  # 1 hour window
+    RATE_LIMIT_MAX_PER_CLASS = 1  # max proposals per failure class per window
 
     def __init__(self, registry: RuntimeRegistry, constitution=None):
         self.registry = registry
         self.constitution = constitution
         self.failure_patterns: List[FailurePattern] = []
         self.hypotheses: List[Hypothesis] = []
+        # Rate limiting: failure_class -> list of proposal timestamps
+        self._proposal_timestamps: Dict[str, List[datetime]] = {}
+
+    def _infer_failure_class(self, record: Dict[str, Any]) -> str:
+        """Infer a stable failure class from a telemetry record.
+
+        Uses pre-computed failure_class if available, otherwise derives from
+        task_id and error signature.
+        """
+        # Use pre-computed failure_class if present
+        fc = record.get("failure_class")
+        if fc and fc != "unclassified":
+            return fc
+
+        task_kind = "unknown"
+        inp = record.get("input") or record.get("task_id", "")
+        if isinstance(inp, dict):
+            if "expression" in inp:
+                task_kind = "math"
+            elif "text" in inp:
+                task_kind = "summarize"
+        elif isinstance(inp, str) and inp:
+            task_kind = inp.split("_")[0].split("-")[0]
+
+        errors = record.get("errors") or ["empty-output"]
+        err = errors[0].lower()
+        if "timeout" in err:
+            err_tag = "timeout"
+        elif "empty" in err or "no output" in err:
+            err_tag = "empty-output"
+        elif "incorrect" in err or "wrong" in err:
+            err_tag = "incorrect-answer"
+        elif "permission" in err:
+            err_tag = "permission-denied"
+        elif "not found" in err:
+            err_tag = "not-found"
+        else:
+            err_tag = "incorrect-answer"
+
+        return f"{task_kind}:{err_tag}"
 
     def analyze_telemetry(self, telemetry_data: List[Dict[str, Any]]) -> List[FailurePattern]:
-        """Analyze telemetry to find recurring failure patterns."""
+        """Analyze telemetry to find recurring failure patterns.
+
+        Each pattern includes the failure_class tag so proposals can
+        reference "this amendment addresses failure class X".
+        """
         patterns = []
 
         task_failures: Dict[str, List[Dict[str, Any]]] = {}
@@ -86,31 +144,28 @@ class Steward:
             errors = record.get("errors", [])
 
             if not success or errors:
-                task_failures.setdefault(task_id, []).append({
-                    "runtime_version": record.get("runtime_version", "unknown"),
-                    "errors": errors,
-                    "input": record.get("input", {}),
-                    "output": record.get("output"),
-                    "failure_class": record.get("failure_class") or "incorrect_or_incomplete_output",
-                })
+                task_failures.setdefault(task_id, []).append(record)
 
         for task_id, failures in task_failures.items():
             if len(failures) >= self.MIN_FAILURE_FREQUENCY:
+                # Infer failure class from the most common class across failures
+                classes = [self._infer_failure_class(f) for f in failures]
+                failure_class = max(set(classes), key=classes.count)
+
+                # Collect sample inputs for regression case generation
+                sample_inputs = [f.get("input", {}) for f in failures[:3]]
+
                 pattern = FailurePattern(
                     id=f"pattern-{task_id}",
-                    description=f"Repeated failure on task {task_id}",
+                    failure_class=failure_class,
+                    description=f"Repeated failure on task {task_id} (class: {failure_class})",
                     frequency=len(failures),
                     affected_tasks=[task_id],
-                    severity=0.7,
-                    runtime_versions_affected=[f["runtime_version"] for f in failures],
-                    failure_class=failures[0]["failure_class"],
-                    regression_case={
-                        "id": f"regression-{task_id}",
-                        "type": "telemetry_replay",
-                        "input": failures[0]["input"],
-                        "expected_output": failures[0]["output"],
-                        "failure_class": failures[0]["failure_class"],
-                    },
+                    severity=min(1.0, 0.3 + 0.1 * len(failures)),
+                    runtime_versions_affected=list(set(
+                        f.get("runtime_version", "unknown") for f in failures
+                    )),
+                    sample_inputs=sample_inputs,
                 )
                 patterns.append(pattern)
 
@@ -128,9 +183,69 @@ class Steward:
                       f"in runtime(s) {sorted(set(pattern.runtime_versions_affected))}",
             supporting_evidence=[pattern.id],
             confidence=0.6,
+            failure_class=pattern.failure_class,
         )
         self.hypotheses.append(hypothesis)
         return hypothesis
+
+    def _build_regression_cases(self, pattern: FailurePattern) -> List[RegressionCase]:
+        """Build auto-derived regression cases from a failure pattern.
+
+        Each case reproduces the exact failure input and encodes the expected
+        correct output (for deterministic task types like math).
+        """
+        cases = []
+        for i, sample in enumerate(pattern.sample_inputs):
+            # Determine task type and compute expected output
+            task_type = "general"
+            expected_output = None
+
+            if isinstance(sample, dict) and "expression" in sample:
+                task_type = "math"
+                expression = str(sample["expression"])
+                allowed = set("0123456789+-*/(). ")
+                if expression and set(expression) <= allowed:
+                    try:
+                        expected_output = str(eval(expression))
+                    except Exception:
+                        pass
+
+            # Build unique ID from failure class + input hash
+            input_str = str(sorted(sample.items())) if isinstance(sample, dict) else str(sample)
+            case_hash = hashlib.sha256(
+                f"{pattern.failure_class}:{input_str}".encode()
+            ).hexdigest()[:8]
+
+            cases.append(RegressionCase(
+                id=f"reg-auto-{case_hash}",
+                failure_class=pattern.failure_class,
+                task_id=f"regression-{pattern.id}-{i}",
+                task_type=task_type,
+                input_data=sample if isinstance(sample, dict) else {"raw": sample},
+                expected_output=expected_output,
+                source="auto-derived",
+                source_reference=pattern.id,
+            ))
+
+        return cases
+
+    def _check_rate_limit(self, failure_class: str) -> bool:
+        """Check if we're within the rate limit for proposals of this failure class.
+
+        Returns True if we should PROCEED (not rate-limited).
+        Returns False if we should SKIP (rate-limited).
+        """
+        now = datetime.utcnow()
+        timestamps = self._proposal_timestamps.get(failure_class, [])
+        # Prune timestamps outside the window
+        cutoff = datetime.timestamp(now) - self.RATE_LIMIT_WINDOW_SECONDS
+        recent = [t for t in timestamps if datetime.timestamp(t) > cutoff]
+        self._proposal_timestamps[failure_class] = recent
+        return len(recent) < self.RATE_LIMIT_MAX_PER_CLASS
+
+    def _record_proposal(self, failure_class: str):
+        """Record a proposal timestamp for rate limiting."""
+        self._proposal_timestamps.setdefault(failure_class, []).append(datetime.utcnow())
 
     def propose_amendment(
         self,
@@ -139,6 +254,7 @@ class Steward:
         description: str,
         rationale: str,
         proposed_diff: Dict[str, Any],
+        regression_cases: List[RegressionCase] = None,
     ) -> AmendmentProposal:
         """Create an amendment proposal from a hypothesis (PROPOSED state only)."""
         proposal_id = f"prop-{hypothesis.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
@@ -154,15 +270,28 @@ class Steward:
             rationale=rationale,
             proposed_diff=proposed_diff,
             hypotheses=[hypothesis],
+            regression_cases=regression_cases or [],
         )
 
     def recommend_amendments(self, telemetry_data: List[Dict[str, Any]]) -> List[AmendmentProposal]:
-        """Full steward loop: analyze telemetry and propose amendments."""
+        """Full steward loop: analyze telemetry and propose amendments.
+
+        Each proposal includes auto-derived regression cases that reproduce
+        the exact failures being addressed, so the evaluator tests against
+        real failures. Rate-limited to prevent spam per failure class.
+        """
         proposals = []
 
         patterns = self.analyze_telemetry(telemetry_data)
 
         for pattern in patterns:
+            # Rate limit: skip this class if we've already proposed recently
+            if not self._check_rate_limit(pattern.failure_class):
+                continue
+
+            # Auto-derive regression cases from the failure pattern
+            regression_cases = self._build_regression_cases(pattern)
+
             for target in [TargetType.PROMPT, TargetType.MEMORY]:
                 hypothesis = self.generate_hypothesis(pattern, target)
                 proposal = self.propose_amendment(
@@ -173,10 +302,12 @@ class Steward:
                     proposed_diff={
                         "target_component": target.value,
                         "change_description": pattern.description,
-                        "regression_case": pattern.regression_case,
-                        "failure_class": pattern.failure_class,
                     },
+                    regression_cases=regression_cases,
                 )
                 proposals.append(proposal)
+
+            # Record all proposals for this failure class (for rate limiting)
+            self._record_proposal(pattern.failure_class)
 
         return proposals

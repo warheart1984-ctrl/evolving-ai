@@ -41,9 +41,27 @@ class Lesson(BaseModel):
 class MemoryStore:
     """Governed memory with lesson lifecycle management."""
     
-    def __init__(self):
+    def __init__(self, persistence=None):
         self._lessons: Dict[str, Lesson] = {}
         self._next_id = 1
+        self._persist = persistence
+        if persistence:
+            self._load_from_persistence()
+
+    def _load_from_persistence(self):
+        rows = self._persist.load_all("lesson")
+        for lesson_id, data in rows.items():
+            try:
+                self._lessons[lesson_id] = Lesson(**data)
+                num = int(lesson_id.split("_")[-1]) + 1
+                if num > self._next_id:
+                    self._next_id = num
+            except Exception:
+                pass
+
+    def _persist_lesson(self, lesson: Lesson):
+        if self._persist:
+            self._persist.save("lesson", lesson.id, lesson.model_dump(mode="json"))
     
     def create_lesson(
         self,
@@ -68,6 +86,7 @@ class MemoryStore:
         )
         
         self._lessons[lesson_id] = lesson
+        self._persist_lesson(lesson)
         return lesson
     
     def validate_lesson(self, lesson_id: str, validator_id: str) -> bool:
@@ -80,6 +99,7 @@ class MemoryStore:
         lesson.times_validated += 1
         lesson.validated_by = validator_id
         lesson.validated_at = datetime.utcnow()
+        self._persist_lesson(lesson)
         return True
     
     def activate_lesson(self, lesson_id: str) -> bool:
@@ -89,6 +109,7 @@ class MemoryStore:
             return False
         
         lesson.status = LessonStatus.ACTIVE
+        self._persist_lesson(lesson)
         return True
     
     def quarantine_lesson(self, lesson_id: str, reason: str, quarantiner_id: str) -> bool:
@@ -102,6 +123,7 @@ class MemoryStore:
         lesson.quarantined_by = quarantiner_id
         lesson.quarantined_at = datetime.utcnow()
         lesson.times_quarantined += 1
+        self._persist_lesson(lesson)
         return True
     
     def deactivate_lesson(self, lesson_id: str) -> bool:
@@ -111,6 +133,7 @@ class MemoryStore:
             return False
         
         lesson.status = LessonStatus.DEPRECATED
+        self._persist_lesson(lesson)
         return True
     
     def get_lesson(self, lesson_id: str) -> Optional[Lesson]:

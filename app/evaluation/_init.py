@@ -1,8 +1,11 @@
-"""Evaluation: runs candidate runtimes against replay datasets and synthetic tests."""
+"""Evaluation: runs candidate runtimes against replay datasets, synthetic tests,
+and adversarial regression cases. Reports suite coverage of known failure classes."""
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
+
+from app.governance.models import CoverageReport, FailureClass, RegressionCase
 
 
 class ReplaySuite(BaseModel):
@@ -35,6 +38,9 @@ class TaskOutcome(BaseModel):
     tool_errors: List[str] = Field(default_factory=list)
     latency_ms: float = 0.0
     cost: float = 0.0
+    failure_class: Optional[str] = None
+    is_regression_case: bool = False
+    regression_case_source: Optional[str] = None
 
 
 class ReplayResult(BaseModel):
@@ -60,6 +66,11 @@ class ReplayResult(BaseModel):
     regressions: int = 0
     new_failures: int = 0
 
+    # Regression case results
+    regression_cases_total: int = 0
+    regression_cases_passed: int = 0
+    regression_cases_failed: int = 0
+
     evaluated_at: datetime = Field(default_factory=datetime.utcnow)
 
     def model_post_init(self, __context: Any) -> None:
@@ -75,42 +86,138 @@ class ReplayResult(BaseModel):
         self.safety_score = 1.0 if not any(o.safety_violation for o in self.outcomes) else 0.8
         self.regressions = sum(1 for o in self.outcomes if o.correctness < 0.5)
         self.new_failures = sum(1 for o in self.outcomes if o.correctness < 0.3)
+        self.regression_cases_total = sum(1 for o in self.outcomes if o.is_regression_case)
+        self.regression_cases_passed = sum(1 for o in self.outcomes if o.is_regression_case and o.correctness >= 0.80)
+        self.regression_cases_failed = self.regression_cases_total - self.regression_cases_passed
+
+
+class FailureClassRegistry:
+    """Tracks all known failure classes across the system.
+
+    Known classes come from three sources:
+    1. Telemetry patterns identified by the steward
+    2. Rejected amendments whose regression cases become permanent
+    3. Hand-authored regression cases in suites
+
+    The registry never shrinks: classes are added but never removed.
+    """
+
+    def __init__(self):
+        self._classes: Dict[str, FailureClass] = {}
+        self._rejection_cases: Dict[str, List[Dict[str, Any]]] = {}
+
+    def register_class(self, class_id: str, description: str = "", source_amendment: str = ""):
+        """Register a known failure class."""
+        if class_id in self._classes:
+            self._classes[class_id].occurrence_count += 1
+            if source_amendment and source_amendment not in self._classes[class_id].source_amendments:
+                self._classes[class_id].source_amendments.append(source_amendment)
+        else:
+            self._classes[class_id] = FailureClass(
+                id=class_id,
+                description=description,
+                source_amendments=[source_amendment] if source_amendment else [],
+            )
+
+    def register_rejection(self, amendment_id: str, failure_class: str, reason: str,
+                           regression_cases: List[Dict[str, Any]] = None):
+        """Register a rejected amendment's failure as a permanent regression case.
+
+        Every REJECTED amendment's failure reason gets converted into a
+        permanent regression case so the eval suite only ever grows.
+        """
+        self.register_class(failure_class, description=reason, source_amendment=amendment_id)
+        if failure_class not in self._rejection_cases:
+            self._rejection_cases[failure_class] = []
+        # Convert RegressionCase objects or dicts
+        for rc in (regression_cases or []):
+            case_dict = rc if isinstance(rc, dict) else rc.model_dump(mode="json")
+            case_dict["source"] = "rejection-derived"
+            case_dict["source_reference"] = amendment_id
+            self._rejection_cases[failure_class].append(case_dict)
+
+    def known_classes(self) -> Set[str]:
+        """All known failure class IDs."""
+        return set(self._classes.keys())
+
+    def get_class(self, class_id: str) -> Optional[FailureClass]:
+        return self._classes.get(class_id)
+
+    def rejection_cases_for_class(self, class_id: str) -> List[Dict[str, Any]]:
+        """Get all rejection-derived regression cases for a failure class."""
+        return list(self._rejection_cases.get(class_id, []))
+
+    def all_rejection_cases(self) -> List[Dict[str, Any]]:
+        """Get all rejection-derived regression cases across all classes."""
+        cases = []
+        for class_cases in self._rejection_cases.values():
+            cases.extend(class_cases)
+        return cases
+
+    def coverage(self, exercised_classes: Set[str]) -> CoverageReport:
+        """Report what fraction of known failure classes are exercised."""
+        known = sorted(self._classes.keys())
+        exercised = sorted(exercised_classes & set(known))
+        return CoverageReport(
+            known_classes=known,
+            exercised_classes=exercised,
+            total_known=len(known),
+            total_exercised=len(exercised),
+            fraction=len(exercised) / len(known) if known else 1.0,
+        )
+
+    def coverage_for_tasks(self, task_defs: List[Dict[str, Any]]) -> CoverageReport:
+        """Compute coverage for a set of task definitions (as used in a suite run)."""
+        exercised = set()
+        for t in task_defs:
+            fc = t.get("failure_class")
+            if fc:
+                exercised.add(fc)
+        return self.coverage(exercised)
 
 
 class Evaluator:
-    """Runs candidate runtimes against replay datasets and synthetic tests.
+    """Runs candidate runtimes against replay datasets, synthetic tests,
+    and adversarial regression cases.
 
     The Evaluator is adversarial: its job is to find problems, not to pass things.
+    It reports suite coverage of known failure classes.
     """
 
     PASS_THRESHOLD = 0.80
 
-    def __init__(self, registry, suites: Dict[str, ReplaySuite] = None):
+    def __init__(self, registry, suites: Dict[str, ReplaySuite] = None,
+                 failure_class_registry: FailureClassRegistry = None):
         self.registry = registry
         self.suites: Dict[str, ReplaySuite] = suites or {}
+        self.failure_class_registry = failure_class_registry or FailureClassRegistry()
 
     def run_suite_against_runtime(
         self,
         suite_id: str,
         runtime_version: str,
+        extra_tasks: List[Dict[str, Any]] = None,
         task_overrides: Dict[str, Any] = None,
     ) -> ReplayResult:
-        """Run a replay suite against a specific runtime version."""
+        """Run a replay suite (optionally augmented with extra regression tasks)
+        against a specific runtime version."""
         suite = self.suites.get(suite_id)
         if not suite:
             raise ValueError(f"Replay suite {suite_id} not found")
 
+        tasks = list(suite.tasks) + (extra_tasks or [])
+
         result = ReplayResult(
             suite_id=suite_id,
             runtime_version=runtime_version,
-            total_tasks=len(suite.tasks),
+            total_tasks=len(tasks),
         )
 
         runtime = None
         if self.registry is not None:
             runtime = self.registry.get_runtime(f"runtime-{runtime_version}")
 
-        for task_def in suite.tasks:
+        for task_def in tasks:
             outcome = self._run_task(task_def, runtime)
             result.outcomes.append(outcome)
 
@@ -143,6 +250,9 @@ class Evaluator:
             tool_errors=tool_errors,
             latency_ms=task_def.get("expected_latency_ms", 0.0),
             cost=task_def.get("expected_cost", 0.0),
+            failure_class=task_def.get("failure_class"),
+            is_regression_case=task_def.get("regression_case", False),
+            regression_case_source=task_def.get("source", {}).get("kind") if isinstance(task_def.get("source"), dict) else task_def.get("source"),
         )
 
     def _simulate_task_execution(self, task_def: Dict, runtime) -> Any:
@@ -175,7 +285,6 @@ class Evaluator:
         if actual == expected:
             return 1.0
         if isinstance(expected, str) and isinstance(actual, str):
-            # Simple substring check; production would use LLM-as-judge
             return 0.7 if expected.lower() in actual.lower() else 0.3
         return 0.5
 
@@ -215,6 +324,9 @@ class Evaluator:
         result.cost_avg = sum(o.cost for o in result.outcomes) / len(result.outcomes)
         result.safety_score = 1.0 if not any(o.safety_violation for o in result.outcomes) else 0.8
 
-        # Regression detection: tasks with clearly wrong output count as regressions
         result.regressions = sum(1 for o in result.outcomes if o.correctness < 0.5)
         result.new_failures = sum(1 for o in result.outcomes if o.correctness < 0.3)
+
+        result.regression_cases_total = sum(1 for o in result.outcomes if o.is_regression_case)
+        result.regression_cases_passed = sum(1 for o in result.outcomes if o.is_regression_case and o.correctness >= 0.80)
+        result.regression_cases_failed = result.regression_cases_total - result.regression_cases_passed

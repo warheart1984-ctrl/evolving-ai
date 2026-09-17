@@ -1,7 +1,7 @@
 """Core models and governance gates for the governed evolving AI runtime."""
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,6 +21,7 @@ class AmendmentStatus(str, Enum):
     REJECTED = "rejected"
     PROMOTED = "promoted"
     REVERTED = "reverted"
+    CONFLICT = "conflict"
 
 
 class TargetType(str, Enum):
@@ -34,7 +35,7 @@ class TargetType(str, Enum):
 class Evidence(BaseModel):
     """Structured evidence from evaluation."""
     id: str
-    type: str  # "replay", "synthetic", "human"
+    type: str  # "replay", "synthetic", "human", "auto-derived"
     description: str
     results: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -62,6 +63,11 @@ class Evaluation(BaseModel):
     evidence: List[Evidence] = Field(default_factory=list)
     passed_gates: List[str] = Field(default_factory=list)
     failed_gates: List[str] = Field(default_factory=list)
+
+    # Suite coverage: fraction of known failure classes this evaluation exercises
+    coverage_known_classes: int = 0
+    coverage_exercised_classes: int = 0
+    coverage_fraction: float = 1.0
 
     evaluated_at: datetime = Field(default_factory=datetime.utcnow)
     evaluator_id: str = "evaluator"
@@ -134,6 +140,7 @@ class RuntimeManifest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: str
+    manifest_hash: str = ""
     version: str
     parent_version: Optional[str] = None
 
@@ -161,6 +168,41 @@ class PromotionResult(BaseModel):
     audit_log: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+# --- Evaluator teeth models ---
+
+class FailureClass(BaseModel):
+    """A categorized class of failure for tracking and regression prevention."""
+    id: str  # e.g. "math:incorrect-answer", "api:timeout"
+    description: str = ""
+    first_seen: datetime = Field(default_factory=datetime.utcnow)
+    occurrence_count: int = 0
+    source_amendments: List[str] = Field(default_factory=list)
+
+
+class RegressionCase(BaseModel):
+    """A regression test case derived from a failure or rejection."""
+    id: str
+    failure_class: str
+    task_id: str
+    task_type: str = "general"
+    input_data: Dict[str, Any] = Field(default_factory=dict)
+    expected_output: Any = None
+    source: str = "auto-derived"  # "auto-derived", "rejection-derived", "manual"
+    source_reference: str = ""  # amendment_id, pattern_id, run_id, etc.
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CoverageReport(BaseModel):
+    """Suite coverage report: fraction of known failure classes exercised."""
+    known_classes: List[str] = Field(default_factory=list)
+    exercised_classes: List[str] = Field(default_factory=list)
+    fraction: float = 1.0
+    total_known: int = 0
+    total_exercised: int = 0
+
+
+# --- Amendment ---
+
 class Amendment(BaseModel):
     """A structured amendment proposal."""
     id: str
@@ -174,6 +216,9 @@ class Amendment(BaseModel):
 
     evidence: List[Evidence] = Field(default_factory=list)
     evaluation: Optional[Evaluation] = None
+
+    # Auto-derived regression cases from the steward
+    regression_cases: List[RegressionCase] = Field(default_factory=list)
 
     status: AmendmentStatus = AmendmentStatus.PROPOSED
 
