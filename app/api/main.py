@@ -45,11 +45,7 @@ store = StateStore(DB_PATH)
 CONSTITUTION_PATH = Path(__file__).resolve().parents[2] / "constitution" / "constitution.yaml"
 PIN_PATH = Path(str(CONSTITUTION_PATH) + ".sha256")
 
-try:
-    constitution = Constitution.from_file(CONSTITUTION_PATH, pin_path=str(PIN_PATH))
-except Exception:
-    # Fallback for tests or if file is missing
-    constitution = Constitution()
+constitution = Constitution.from_file(CONSTITUTION_PATH, pin_path=str(PIN_PATH))
 
 # --- Components with persistence ---
 
@@ -351,7 +347,8 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
         parent_result = evaluator.run_suite_against_runtime(
             suite_id, amendment.parent_version, extra_tasks=extra_tasks
         )
-        candidate_label = f"candidate-for-{amendment.parent_version}"
+        candidate = governor.materialize_candidate(amendment)
+        candidate_label = candidate.version
         candidate_result = evaluator.run_suite_against_runtime(
             suite_id, candidate_label, extra_tasks=extra_tasks
         )

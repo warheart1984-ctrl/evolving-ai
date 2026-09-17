@@ -94,7 +94,7 @@ class Governor:
                 "gates_failed": ["evaluation_evidence_exists"],
             }
 
-        gates = ConstitutionGates.check_all_gates(amendment.evaluation)
+        gates = ConstitutionGates.check_all_gates(amendment.evaluation, self.constitution)
         gates_passed = [name for name, gate in gates.items() if gate.passed]
         gates_failed = [name for name, gate in gates.items() if not gate.passed]
 

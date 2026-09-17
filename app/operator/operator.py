@@ -1,4 +1,5 @@
 from datetime import datetime
+import ast
 from typing import Optional, Dict, Any, List
 
 from pydantic import BaseModel, Field
@@ -84,7 +85,23 @@ class Operator:
         # 2. Load the appropriate prompts based on runtime config
         # 3. Execute with the configured tools
         # 4. Return the output
-        return f"Task output using runtime {self.current_runtime.version}"
+        expression = input_data.get("expression")
+        if expression is not None:
+            value = self._safe_arithmetic(str(expression))
+            if "step-by-step" in self.current_runtime.prompts.get("system", "").lower():
+                return f"{expression} = {value}"
+            return str(value)
+        return f"Processed with {self.current_runtime.prompts.get('system', 'default prompt')}: {input_data}"
+
+    @staticmethod
+    def _safe_arithmetic(expression: str):
+        tree = ast.parse(expression, mode="eval")
+        allowed = (ast.Expression, ast.Constant, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.USub, ast.UAdd)
+        if any(not isinstance(node, allowed) for node in ast.walk(tree)):
+            raise ValueError("unsupported expression")
+        if any(isinstance(node, ast.Constant) and (not isinstance(node.value, (int, float)) or isinstance(node.value, bool)) for node in ast.walk(tree)):
+            raise ValueError("unsupported constant")
+        return _ArithmeticVisitor().visit(tree.body)
     
     def _validate_output(self, output: Any, input_data: Dict) -> List[str]:
         """Validate the task output."""
@@ -92,6 +109,32 @@ class Operator:
         if output is None:
             errors.append("No output produced")
         return errors
+
+    def inspect_runtime(self) -> Dict[str, Any]:
+        return {
+            "version": self.current_runtime.version,
+            "model": self.current_runtime.model_identifier,
+            "constitution": self.current_runtime.constitution_version,
+            "prompts": dict(self.current_runtime.prompts),
+            "tools": dict(self.current_runtime.tools),
+            "memory": dict(self.current_runtime.memory),
+            "evaluation": dict(self.current_runtime.evaluation),
+        }
+
+    def cannot_modify_runtime(self) -> Dict[str, str]:
+        return {"status": "protected", "message": "Operator cannot modify runtime in place."}
+
+
+class _ArithmeticVisitor(ast.NodeVisitor):
+    def visit_Constant(self, node): return node.value
+    def visit_UnaryOp(self, node): return self.visit(node.operand) if isinstance(node.op, ast.UAdd) else -self.visit(node.operand)
+    def visit_BinOp(self, node):
+        left, right = self.visit(node.left), self.visit(node.right)
+        if isinstance(node.op, ast.Add): return left + right
+        if isinstance(node.op, ast.Sub): return left - right
+        if isinstance(node.op, ast.Mult): return left * right
+        if isinstance(node.op, ast.Div): return left / right
+        raise ValueError("unsupported operator")
     
     def inspect_runtime(self) -> Dict[str, Any]:
         """Inspect the current runtime configuration (read-only)."""

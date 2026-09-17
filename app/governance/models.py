@@ -3,7 +3,38 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class FrozenDict(dict):
+    """A recursive immutable dict used to enforce runtime-manifest immutability.
+
+    Subclasses ``dict`` so pydantic serialization, ``json.dumps``, deepcopy,
+    and equality against plain dicts all keep working, but every mutation
+    method raises ``TypeError``.
+    """
+
+    def _mutate(self, *args, **kwargs):
+        raise TypeError("RuntimeManifest containers are immutable")
+
+    __setitem__ = _mutate
+    __delitem__ = _mutate
+    __ior__ = _mutate
+    pop = _mutate
+    popitem = _mutate
+    clear = _mutate
+    setdefault = _mutate
+    update = _mutate
+
+    @staticmethod
+    def _freeze(value: Any) -> Any:
+        if isinstance(value, dict):
+            return FrozenDict({k: FrozenDict._freeze(v) for k, v in value.items()})
+        return value
+
+    @classmethod
+    def freeze(cls, value: Dict[str, Any]) -> "FrozenDict":
+        return cls._freeze(value)
 
 
 class Decision(str, Enum):
@@ -85,8 +116,9 @@ class ConstitutionGates:
     """Machine-enforced promotion gates based on the constitution."""
 
     @staticmethod
-    def check_required_tests(evaluation: Evaluation) -> GateResult:
-        passed = evaluation.correctness >= 0.80 and evaluation.instruction_following >= 0.85
+    def check_required_tests(evaluation: Evaluation, constitution=None) -> GateResult:
+        rules = getattr(constitution, "evaluation_rules", {})
+        passed = evaluation.correctness >= rules.get("min_correctness", 0.80) and evaluation.instruction_following >= rules.get("min_instruction_following", 0.85)
         return GateResult(
             gate_name="required_tests_pass",
             passed=passed,
@@ -98,8 +130,9 @@ class ConstitutionGates:
         )
 
     @staticmethod
-    def check_no_safety_failures(evaluation: Evaluation) -> GateResult:
-        passed = evaluation.safety >= 1.0 and evaluation.regressions == 0
+    def check_no_safety_failures(evaluation: Evaluation, constitution=None) -> GateResult:
+        rules = getattr(constitution, "evaluation_rules", {})
+        passed = evaluation.safety >= 1.0 and evaluation.regressions <= rules.get("max_safety_violations", 0)
         return GateResult(
             gate_name="no_safety_failures",
             passed=passed,
@@ -126,10 +159,10 @@ class ConstitutionGates:
         )
 
     @staticmethod
-    def check_all_gates(evaluation: Evaluation) -> Dict[str, GateResult]:
+    def check_all_gates(evaluation: Evaluation, constitution=None) -> Dict[str, GateResult]:
         return {
-            "required_tests_pass": ConstitutionGates.check_required_tests(evaluation),
-            "no_safety_failures": ConstitutionGates.check_no_safety_failures(evaluation),
+            "required_tests_pass": ConstitutionGates.check_required_tests(evaluation, constitution),
+            "no_safety_failures": ConstitutionGates.check_no_safety_failures(evaluation, constitution),
             "no_unexplained_regressions": ConstitutionGates.check_no_unexplained_regressions(evaluation),
             "evaluation_evidence_exists": ConstitutionGates.check_evaluation_evidence(evaluation),
         }
@@ -158,6 +191,37 @@ class RuntimeManifest(BaseModel):
 
     amendment_id: Optional[str] = None
     rollback_to: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _deep_freeze(self) -> "RuntimeManifest":
+        """Freeze the manifest and all nested dicts so ``frozen=True`` is a real guarantee.
+
+        Top-level ``ConfigDict(frozen=True)`` only blocks attribute assignment;
+        without this, ``runtime.prompts["system"] = "rogue"`` would still mutate
+        a promoted runtime. We rebuild every container field through the
+        immutable ``FrozenDict`` (object-level, so frozen=True is not violated).
+        """
+        object.__setattr__(
+            self,
+            "prompts",
+            FrozenDict.freeze(self.prompts),
+        )
+        object.__setattr__(
+            self,
+            "tools",
+            FrozenDict.freeze(self.tools),
+        )
+        object.__setattr__(
+            self,
+            "memory",
+            FrozenDict.freeze(self.memory),
+        )
+        object.__setattr__(
+            self,
+            "evaluation",
+            FrozenDict.freeze(self.evaluation),
+        )
+        return self
 
 
 class PromotionResult(BaseModel):

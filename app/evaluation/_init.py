@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
 
-from app.governance.models import CoverageReport, FailureClass, RegressionCase
+from app.governance.models import CoverageReport, FailureClass, RegressionCase, RuntimeManifest
 
 
 class ReplaySuite(BaseModel):
@@ -230,7 +230,20 @@ class Evaluator:
         input_data = task_def.get("input", {})
         expected = task_def.get("expected_output", None)
 
-        actual_output = self._simulate_task_execution(task_def, runtime)
+        if runtime is None:
+            # Keep isolated evaluator tests usable without mutating the registry.
+            runtime = RuntimeManifest(
+                id="runtime-evaluator-default", version="evaluator-default",
+                model_identifier="evaluator-default", constitution_version="v1",
+                created_by="evaluator",
+            )
+        # Replay the real Operator path so candidate behavior is causal.
+        from app.operator.operator import Operator
+        operator_result = Operator(
+            registry=self.registry,
+            current_runtime=runtime,
+        ).execute_task(task_id=task_id, input_data=input_data)
+        actual_output = operator_result.output
 
         correctness = self._assess_correctness(actual_output, expected)
         instruction_following = self._assess_instruction_following(actual_output, input_data)

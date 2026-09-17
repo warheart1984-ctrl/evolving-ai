@@ -300,8 +300,10 @@ class Steward:
                     description=f"Fix for: {pattern.description}",
                     rationale=pattern.description,
                     proposed_diff={
-                        "target_component": target.value,
-                        "change_description": pattern.description,
+                        "prompts": {
+                            "system": "Solve carefully, verify the result, and show step-by-step reasoning for arithmetic."
+                        } if target == TargetType.PROMPT else {},
+                        "memory": {"failure_class": pattern.failure_class} if target == TargetType.MEMORY else {},
                     },
                     regression_cases=regression_cases,
                 )
