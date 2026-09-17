@@ -18,6 +18,8 @@ class FailurePattern(BaseModel):
     first_seen: datetime = Field(default_factory=datetime.utcnow)
     last_seen: datetime = Field(default_factory=datetime.utcnow)
     runtime_versions_affected: List[str] = Field(default_factory=list)
+    failure_class: str = "unknown"
+    regression_case: Dict[str, Any] = Field(default_factory=dict)
 
 
 class Hypothesis(BaseModel):
@@ -87,6 +89,9 @@ class Steward:
                 task_failures.setdefault(task_id, []).append({
                     "runtime_version": record.get("runtime_version", "unknown"),
                     "errors": errors,
+                    "input": record.get("input", {}),
+                    "output": record.get("output"),
+                    "failure_class": record.get("failure_class") or "incorrect_or_incomplete_output",
                 })
 
         for task_id, failures in task_failures.items():
@@ -98,6 +103,14 @@ class Steward:
                     affected_tasks=[task_id],
                     severity=0.7,
                     runtime_versions_affected=[f["runtime_version"] for f in failures],
+                    failure_class=failures[0]["failure_class"],
+                    regression_case={
+                        "id": f"regression-{task_id}",
+                        "type": "telemetry_replay",
+                        "input": failures[0]["input"],
+                        "expected_output": failures[0]["output"],
+                        "failure_class": failures[0]["failure_class"],
+                    },
                 )
                 patterns.append(pattern)
 
@@ -160,6 +173,8 @@ class Steward:
                     proposed_diff={
                         "target_component": target.value,
                         "change_description": pattern.description,
+                        "regression_case": pattern.regression_case,
+                        "failure_class": pattern.failure_class,
                     },
                 )
                 proposals.append(proposal)

@@ -15,6 +15,7 @@ class ExecutionTelemetry(BaseModel):
     
     success: bool
     errors: List[str] = Field(default_factory=list)
+    failure_class: Optional[str] = None
     
     tools_used: List[str] = Field(default_factory=list)
     
@@ -60,6 +61,18 @@ class TelemetryStore:
         if runtime_version:
             return self.get_records_by_runtime(runtime_version)
         return [r for r in self._records.values() if not r.success]
+
+    @staticmethod
+    def classify_failure(errors: List[str], output: Any = None) -> str:
+        """Return a stable category that can be tracked by the Steward."""
+        text = " ".join(errors or []).lower()
+        if any(term in text for term in ("safety", "harm", "unsafe")):
+            return "safety"
+        if any(term in text for term in ("timeout", "latency")):
+            return "latency"
+        if any(term in text for term in ("tool", "connection")):
+            return "tool_failure"
+        return "incorrect_or_incomplete_output"
     
     def get_success_records(self, runtime_version: str = None) -> List[ExecutionTelemetry]:
         """Get success records, optionally filtered by runtime."""

@@ -25,7 +25,11 @@ from constitution.constitution import Constitution
 
 # --- Components ---
 
-constitution = Constitution()
+_constitution_dir = Path(__file__).resolve().parents[2] / "constitution"
+constitution = Constitution.load_pinned(
+    _constitution_dir / "constitution.yaml",
+    _constitution_dir / "constitution.yaml.sha256",
+)
 registry = RuntimeRegistry()
 governor = Governor(registry, constitution)
 steward = Steward(registry, constitution)
@@ -319,6 +323,20 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
     amendment.evaluation = evaluation
     amendment.status = AmendmentStatus.REVIEW
 
+    known_failure_classes = {
+        r.failure_class for r in telemetry_store.get_failure_records() if r.failure_class
+    }
+    exercised_failure_classes = {
+        task.get("failure_class")
+        for task in evaluator.suites.get(suite_id, ReplaySuite(id=suite_id, name=suite_id)).tasks
+        if task.get("failure_class")
+    }
+    coverage = (
+        len(known_failure_classes & exercised_failure_classes) / len(known_failure_classes)
+        if known_failure_classes else 1.0
+    )
+    uncovered_failure_classes = sorted(known_failure_classes - exercised_failure_classes)
+
     return {
         "amendment_id": amendment_id,
         "status": amendment.status.value,
@@ -327,19 +345,41 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
         "safety": evaluation.safety,
         "regressions": evaluation.regressions,
         "evidence": [e.model_dump(mode="json") for e in evaluation.evidence],
+        "suite_coverage": {
+            "known_failure_classes": len(known_failure_classes),
+            "exercised_failure_classes": len(known_failure_classes & exercised_failure_classes),
+            "fraction": coverage,
+            "uncovered_failure_classes": uncovered_failure_classes,
+        },
     }
 
 
 # --- Governance endpoints ---
 
 @app.post("/governance/approve/{amendment_id}")
-async def approve_amendment(amendment_id: str, reviewer: str = "human"):
+async def approve_amendment(
+    amendment_id: str,
+    reviewer: str = "human",
+    evidence_ids: Optional[List[str]] = None,
+):
     """Approve and promote an amendment (human approval is mandatory)."""
     amendment = amendments.get(amendment_id)
     if not amendment:
         raise HTTPException(status_code=404, detail=f"Amendment {amendment_id} not found")
     if amendment.evaluation is None:
         raise HTTPException(status_code=400, detail="Amendment has no evaluation; run evaluation first")
+    requested_evidence_ids = set(evidence_ids or [])
+    available_evidence_ids = {e.id for e in amendment.evaluation.evidence}
+    if not requested_evidence_ids or not requested_evidence_ids.issubset(available_evidence_ids):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Approval must reference evaluation evidence IDs",
+                "available_evidence_ids": sorted(available_evidence_ids),
+            },
+        )
+    if reviewer == amendment.proposer:
+        raise HTTPException(status_code=403, detail="Reviewer cannot be the amendment proposer")
 
     amendment.status = AmendmentStatus.APPROVED
     amendment.reviewer = reviewer
@@ -475,6 +515,7 @@ async def record_telemetry(
     cost: float = 0.0,
     errors: List[str] = None,
     user_feedback: Optional[Dict[str, Any]] = None,
+    failure_class: Optional[str] = None,
 ):
     """Record operator execution telemetry (including failures and user feedback)."""
     telemetry = ExecutionTelemetry(
@@ -486,6 +527,7 @@ async def record_telemetry(
         output=output,
         success=success,
         errors=errors or [],
+        failure_class=failure_class or TelemetryStore.classify_failure(errors or [], output),
         tools_used=tools_used or [],
         latency_ms=latency_ms,
         cost=cost,
@@ -506,6 +548,7 @@ async def get_failure_telemetry(runtime_version: Optional[str] = None):
             "task_id": r.task_id,
             "success": r.success,
             "errors": r.errors,
+            "failure_class": r.failure_class,
             "tools_used": r.tools_used,
             "latency_ms": r.latency_ms,
             "cost": r.cost,
@@ -560,6 +603,13 @@ async def steward_analyze():
             proposer="steward",
         )
         amendments[amendment.id] = amendment
+        regression_case = p.proposed_diff.get("regression_case")
+        if regression_case:
+            suite = evaluator.suites.setdefault(
+                "core", ReplaySuite(id="core", name="Core regression suite")
+            )
+            if not any(t.get("id") == regression_case.get("id") for t in suite.tasks):
+                suite.add_task(regression_case)
         created.append(amendment.id)
 
     return {"status": "analyzed", "failures": len(failures), "proposals": created}

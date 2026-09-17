@@ -1,0 +1,28 @@
+name: Constitution integrity
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify constitution hash and paired changes
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            python scripts/verify_constitution_pin.py --base "${{ github.event.pull_request.base.sha }}"
+          else
+            python scripts/verify_constitution_pin.py
+          fi

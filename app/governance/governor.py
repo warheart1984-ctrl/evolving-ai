@@ -69,6 +69,13 @@ class Governor:
             result.reason = "Amendment must have evaluation results before approval"
             return result
 
+        if not amendment.evaluation.evidence:
+            result.reason = "Approval requires at least one linked evaluation evidence item"
+            return result
+        if amendment.reviewer and amendment.reviewer == amendment.proposer:
+            result.reason = "Reviewer cannot be the amendment proposer"
+            return result
+
         gate_result = self.evaluate_amendment(amendment)
         if not gate_result["success"]:
             result.reason = f"Governance gates failed: {gate_result['gates_failed']}"
@@ -158,11 +165,14 @@ class Governor:
 
     def rollback(self, target_version: str) -> Optional[RuntimeManifest]:
         """Rollback to a previous runtime version (auditable)."""
+        previous = self.registry.get_current()
         runtime = self.registry.rollback_to(target_version)
         if runtime:
             self.rollback_log.append({
                 "action": "rollback",
+                "from_runtime": previous.id if previous else None,
                 "to_runtime": runtime.id,
+                "reviewer": "governor",
                 "timestamp": datetime.utcnow().isoformat(),
             })
         return runtime

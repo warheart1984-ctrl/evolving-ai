@@ -1,6 +1,8 @@
 """Constitution model - the versioned rule set governing the runtime."""
 from datetime import datetime
 from typing import Any, Dict
+import hashlib
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
@@ -52,3 +54,19 @@ class Constitution(BaseModel):
             return cls(**data)
         except ImportError:
             return cls()
+
+    @staticmethod
+    def sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @classmethod
+    def load_pinned(cls, path: Path, pin_path: Path) -> "Constitution":
+        """Load only when the on-disk constitution matches its committed pin."""
+        actual = cls.sha256(path)
+        expected = pin_path.read_text(encoding="utf-8").strip().lower()
+        if actual != expected:
+            raise RuntimeError(
+                f"CRITICAL: constitution hash mismatch for {path}; "
+                f"expected {expected}, got {actual}"
+            )
+        return cls.from_file(path)
