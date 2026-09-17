@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -102,6 +102,12 @@ if registry.get_current() is None:
 
 # --- App ---
 
+# P7: CORS is explicit and fail-closed. No credentials + no wildcard by default.
+_cors_origins = [
+    o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:8000").split(",")
+    if o.strip()
+]
+
 app = FastAPI(
     title="Governed Evolving AI Runtime",
     description="Prototype of a governed, evolving AI runtime with versioned amendments",
@@ -110,10 +116,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-API-Key", "Content-Type"],
 )
 
 
@@ -127,21 +133,10 @@ async def execute_task(task_id: str, input_data: Dict[str, Any]):
         raise HTTPException(status_code=404, detail="No runtime configured")
 
     operator = Operator(registry=registry, current_runtime=current)
+    operator.set_constitution_hash(constitution.content_hash)
     result = operator.execute_task(task_id=task_id, input_data=input_data)
 
-    telemetry = ExecutionTelemetry(
-        run_id="",
-        runtime_id=current.id,
-        runtime_version=current.version,
-        task_id=task_id,
-        input=input_data,
-        output=result.output,
-        success=result.success,
-        errors=result.errors,
-        tools_used=result.tools_used,
-        latency_ms=result.latency_ms,
-        cost=result.cost,
-    )
+    telemetry = operator.build_telemetry(result, input_data)
     run_id = telemetry_store.record_execution(telemetry)
 
     body = result.model_dump(mode="json")
@@ -197,6 +192,7 @@ async def propose_amendment(
     rationale: str,
     proposed_diff: Dict[str, Any],
     proposer: str = "steward",
+    _key: str = Depends(require_governance_key),
 ):
     """Steward proposes an amendment (PROPOSED state; cannot promote)."""
     if target not in (TargetType.PROMPT, TargetType.MEMORY):
@@ -260,7 +256,7 @@ async def get_amendment(amendment_id: str):
 # --- Evaluation endpoints ---
 
 @app.post("/evaluation/run")
-async def run_evaluation(suite_id: str, runtime_version: str):
+async def run_evaluation(suite_id: str, runtime_version: str, _key: str = Depends(require_governance_key)):
     """Run a replay evaluation suite against a runtime version."""
     try:
         result = evaluator.run_suite_against_runtime(suite_id, runtime_version)
@@ -310,7 +306,7 @@ async def run_evaluation(suite_id: str, runtime_version: str):
 
 
 @app.post("/governance/evaluate/{amendment_id}")
-async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
+async def evaluate_amendment(amendment_id: str, suite_id: str = "core", _key: str = Depends(require_governance_key)):
     """Run the evaluator against parent and candidate with auto-derived regression cases.
 
     The evaluation augments the base suite with the amendment's regression cases
@@ -367,7 +363,12 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
         candidate_runtime=candidate_result.runtime_version,
         correctness=candidate_result.correctness_avg,
         instruction_following=candidate_result.instruction_following_avg,
+        robustness=candidate_result.robustness_score,
         safety=candidate_result.safety_score,
+        latency_ms=candidate_result.latency_avg_ms,
+        cost_per_task=candidate_result.cost_avg,
+        parent_latency_ms=parent_result.latency_avg_ms,
+        parent_cost_per_task=parent_result.cost_avg,
         regressions=candidate_result.regressions,
         coverage_known_classes=coverage.total_known,
         coverage_exercised_classes=coverage.total_exercised,
@@ -421,6 +422,7 @@ async def evaluate_amendment(amendment_id: str, suite_id: str = "core"):
                 runtime_version=candidate_result.runtime_version,
             )
         ],
+        candidate_manifest_hash=candidate.manifest_hash,
         evaluator_id="evaluator:v0",
     )
 
@@ -556,6 +558,7 @@ async def create_lesson(
     created_by: str,
     triggering_task_id: Optional[str] = None,
     evidence: Optional[List[Dict[str, Any]]] = None,
+    _key: str = Depends(require_governance_key),
 ):
     """Create a new lesson (starts as candidate; never auto-trusted)."""
     lesson = memory_store.create_lesson(
@@ -576,7 +579,7 @@ async def create_lesson(
 
 
 @app.post("/memory/lesson/{lesson_id}/validate")
-async def validate_lesson(lesson_id: str, validator_id: str):
+async def validate_lesson(lesson_id: str, validator_id: str, _key: str = Depends(require_governance_key)):
     """Move a lesson from candidate to validated."""
     success = memory_store.validate_lesson(lesson_id, validator_id)
     if not success:
@@ -592,7 +595,7 @@ async def validate_lesson(lesson_id: str, validator_id: str):
 
 
 @app.post("/memory/lesson/{lesson_id}/activate")
-async def activate_lesson(lesson_id: str):
+async def activate_lesson(lesson_id: str, _key: str = Depends(require_governance_key)):
     """Activate a validated lesson."""
     success = memory_store.activate_lesson(lesson_id)
     if not success:
@@ -601,7 +604,12 @@ async def activate_lesson(lesson_id: str):
 
 
 @app.post("/memory/lesson/{lesson_id}/quarantine")
-async def quarantine_lesson(lesson_id: str, reason: str, quarantiner_id: str):
+async def quarantine_lesson(
+    lesson_id: str,
+    reason: str,
+    quarantiner_id: str,
+    _key: str = Depends(require_governance_key),
+):
     """Quarantine a lesson."""
     success = memory_store.quarantine_lesson(lesson_id, reason, quarantiner_id)
     if not success:
@@ -634,36 +642,98 @@ async def list_lessons(status: Optional[str] = None, scope: Optional[str] = None
 
 # --- Telemetry endpoints ---
 
+_MAX_TELEMETRY_BYTES = 64 * 1024  # 64 KB payload cap
+
+
 @app.post("/telemetry/record")
 async def record_telemetry(
-    runtime_version: str,
-    task_id: str,
-    input_data: Dict[str, Any],
-    output: Any,
-    success: bool,
-    tools_used: List[str] = None,
-    latency_ms: float = 0.0,
-    cost: float = 0.0,
-    errors: List[str] = None,
-    user_feedback: Optional[Dict[str, Any]] = None,
+    payload: dict,
+    request: Request,
+    _key: str = Depends(require_governance_key),
 ):
-    """Record operator execution telemetry (including failures and user feedback)."""
+    """Record execution telemetry from a governed subsystem.
+
+    Requires the governance API key. Submitting a payload is trust-scored:
+    - payloads carrying an operator/ evaluator/ steward source identity with
+      a runtime_manifest_hash that resolves to a real, matching runtime are
+      treated as ``trusted`` (eligible for steward analysis).
+    - anything unmatched is persisted to the untrusted partition (audit only;
+      never aggregated into failure classes or steward proposals).
+    - rate-limited per client IP and capped at 64 KB / 50 fields.
+    """
+    from app.telemetry._init import (
+        _external_telemetry_limiter,
+        MAX_TELEMETRY_PAYLOAD_BYTES,
+        MAX_TELEMETRY_FIELDS,
+        manifest_hash as _manifest_hash,
+    )
+
+    # --- payload limits ---
+    raw_size = len(json.dumps(payload, sort_keys=True))
+    if raw_size > MAX_TELEMETRY_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Telemetry payload exceeds 64 KB limit")
+    if len(payload) > MAX_TELEMETRY_FIELDS:
+        raise HTTPException(status_code=413, detail="Telemetry payload has too many fields")
+
+    # --- rate limit ---
+    client_ip = request.client.host if request.client else "unknown"
+    if not _external_telemetry_limiter.allow(client_ip):
+        raise HTTPException(status_code=429, detail="Telemetry rate limit exceeded")
+
+    source = payload.get("source", "external")
+    source_identity = payload.get("source_identity") or {}
+    runtime_manifest_hash = payload.get("runtime_manifest_hash")
+    constitution_hash = payload.get("constitution_hash")
+    operation = payload.get("operation")
+
+    # --- trust scoring ---
+    # A record is trusted only when the source identity names a subsystem,
+    # the hash is a 64-hex SHA-256, and the hash matches an existing runtime.
+    trusted = False
+    if source in ("operator", "evaluator", "steward"):
+        if isinstance(runtime_manifest_hash, str) and len(runtime_manifest_hash) == 64:
+            try:
+                by_hash = None
+                for m in registry.list_runtimes():
+                    if m.manifest_hash == runtime_manifest_hash:
+                        by_hash = m
+                        break
+                if by_hash is not None:
+                    trusted = True
+            except Exception:
+                trusted = False
+
     telemetry = ExecutionTelemetry(
         run_id="",
-        runtime_id=f"runtime-{runtime_version}",
-        runtime_version=runtime_version,
-        task_id=task_id,
-        input=input_data,
-        output=output,
-        success=success,
-        errors=errors or [],
-        tools_used=tools_used or [],
-        latency_ms=latency_ms,
-        cost=cost,
-        user_feedback=user_feedback,
+        runtime_id=f"runtime-{payload.get('runtime_version', 'unknown')}",
+        runtime_version=payload.get("runtime_version", "unknown"),
+        task_id=payload.get("task_id", "unknown"),
+        input=payload.get("input", {}),
+        output=payload.get("output"),
+        success=payload.get("success", False),
+        errors=payload.get("errors") or [],
+        tools_used=payload.get("tools_used") or [],
+        latency_ms=payload.get("latency_ms", 0.0),
+        cost=payload.get("cost", 0.0),
+        user_feedback=payload.get("user_feedback"),
+        source=source,
+        source_identity=dict(source_identity),
+        trusted=trusted,
+        runtime_manifest_hash=runtime_manifest_hash,
+        constitution_hash=constitution_hash,
+        operation=operation,
     )
     run_id = telemetry_store.record_execution(telemetry)
-    return {"status": "recorded", "run_id": run_id}
+    return {
+        "status": "recorded",
+        "run_id": run_id,
+        "trusted": telemetry.trusted,
+        "note": (
+            "recorded as untrusted (audit-only)"
+            if not telemetry.trusted
+            else "recorded as trusted (eligible for analysis)"
+        ),
+    }
 
 
 @app.get("/telemetry/failures")
@@ -719,7 +789,7 @@ async def get_failure_classes_summary(runtime_version: Optional[str] = None):
 # --- Steward loop ---
 
 @app.post("/steward/analyze")
-async def steward_analyze():
+async def steward_analyze(_key: str = Depends(require_governance_key)):
     """Run the steward analysis loop: telemetry → patterns → proposals with auto-derived regression cases."""
     failures = telemetry_store.get_failure_records()
     if not failures:

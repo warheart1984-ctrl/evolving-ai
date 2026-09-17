@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
 
+from app.evaluation.arithmetic import safe_arithmetic
 from app.governance.models import CoverageReport, FailureClass, RegressionCase, RuntimeManifest
 
 
@@ -240,11 +241,37 @@ class Evaluator:
             )
         # Replay the real Operator path so candidate behavior is causal.
         from app.operator.operator import Operator
-        operator_result = Operator(
-            registry=self.registry,
-            current_runtime=runtime,
-        ).execute_task(task_id=task_id, input_data=input_data)
-        actual_output = operator_result.output
+        try:
+            operator_result = Operator(
+                registry=self.registry,
+                current_runtime=runtime,
+            ).execute_task(task_id=task_id, input_data=input_data)
+            actual_output = operator_result.output
+        except (ValueError, ArithmeticError) as e:
+            # Malicious or malformed input must fail the task without executing
+            # anything (the arithmetic evaluator rejects it), never crash the
+            # whole evaluation run. Record it as a failed outcome.
+            return TaskOutcome(
+                task_id=task_id,
+                input=input_data,
+                expected_output=expected,
+                actual_output="<rejected>",
+                runtime_version=runtime.version if runtime else "unknown",
+                correctness=0.0,
+                instruction_following=0.0,
+                safety_violation=False,
+                notes=f"Task input rejected by safe arithmetic evaluator: {e}",
+                tool_errors=[str(e)],
+                latency_ms=task_def.get("expected_latency_ms", 0.0),
+                cost=task_def.get("expected_cost", 0.0),
+                failure_class=task_def.get("failure_class"),
+                is_regression_case=task_def.get("regression_case", False),
+                regression_case_source=(
+                    task_def.get("source", {}).get("kind")
+                    if isinstance(task_def.get("source"), dict)
+                    else task_def.get("source")
+                ),
+            )
 
         correctness = self._assess_correctness(actual_output, expected)
         instruction_following = self._assess_instruction_following(actual_output, input_data)
@@ -281,12 +308,10 @@ class Evaluator:
 
         if task_type == "math":
             expression = str(input_data.get("expression", ""))
-            allowed = set("0123456789+-*/(). ")
-            if expression and set(expression) <= allowed:
-                try:
-                    return str(eval(expression))  # chars whitelisted: arithmetic only
-                except Exception:
-                    pass
+            try:
+                return str(safe_arithmetic(expression))
+            except ArithmeticError:
+                pass
             return f"Result: {expression}"
         elif task_type == "summarize":
             return f"Summary of: {str(input_data.get('text', ''))[:100]}..."

@@ -42,12 +42,21 @@ class TestSQLitePersistence:
             run_id="", runtime_id="runtime-v0", runtime_version="v0",
             task_id="t1", input={"expression": "2+2"}, output="5",
             success=False, errors=["Incorrect answer"],
+            source="operator", trusted=True,
         ))
 
         ts2 = TelemetryStore(persistence=store)
         records = ts2.get_failure_records()
         assert len(records) == 1
         assert records[0].failure_class == "math:incorrect-answer"
+
+        # Untrusted records are never loaded into the trusted set after restart.
+        ts2.record_execution(ExecutionTelemetry(
+            run_id="", runtime_id="runtime-v0", runtime_version="v0",
+            task_id="t2", input={"expression": "2+2"}, output="5",
+            success=False, errors=["Incorrect answer"], trusted=False,
+        ))
+        assert len(ts2.get_failure_records()) == 1
 
     def test_amendment_loads_regression_cases_after_reload(self, tmp_path):
         store = StateStore(str(tmp_path / "evolving.db"))
@@ -87,10 +96,10 @@ class TestGovernanceAuth:
         resp = client.post("/governance/approve/prop-x", params={"reviewer": "human"})
         assert resp.status_code == 401
 
-    def test_approve_accepts_dev_key(self, client):
+    def test_approve_accepts_config_key(self, client):
         resp = client.post(
             "/governance/approve/prop-x",
-            headers={"X-API-Key": "governance-dev-key"},
+            headers={"X-API-Key": "test-governance-key"},
             params={"reviewer": "human"},
         )
         # Amendment prop-x doesn't exist, but the auth gate must have passed
@@ -105,8 +114,8 @@ class TestGovernanceAuth:
         resp = client.post("/runtime/rollback/v0")
         assert resp.status_code == 401
 
-    def test_rollback_accepts_dev_key(self, client):
-        resp = client.post("/runtime/rollback/v0", headers={"X-API-Key": "governance-dev-key"})
+    def test_rollback_accepts_config_key(self, client):
+        resp = client.post("/runtime/rollback/v0", headers={"X-API-Key": "test-governance-key"})
         assert resp.status_code == 200
         assert resp.json()["status"] == "rolled_back"
 

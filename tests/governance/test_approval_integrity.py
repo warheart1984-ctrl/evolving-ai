@@ -17,11 +17,20 @@ def governor():
     return Governor(registry, constitution), registry
 
 
+def _bind_hash(governor, amendment):
+    """Stamp the exact candidate manifest hash onto the evaluation (P5)."""
+    amendment.evaluation.candidate_manifest_hash = governor.build_candidate(amendment).manifest_hash
+    return amendment
+
+
 def _evaluation(amendment_id, evidence_ids=("ev-1",)):
     return Evaluation(
         id=f"eval-{amendment_id}", amendment_id=amendment_id,
         parent_runtime="v0", candidate_runtime="v1",
-        correctness=0.95, instruction_following=0.92, safety=1.0, regressions=0,
+        correctness=0.95, instruction_following=0.92, robustness=0.9,
+        safety=1.0, regressions=0,
+        latency_ms=100.0, cost_per_task=0.01,
+        parent_latency_ms=100.0, parent_cost_per_task=0.01,
         evidence=[Evidence(id=eid, type="replay", description="replay", runtime_version="v1")
                   for eid in evidence_ids],
     )
@@ -55,13 +64,13 @@ class TestEvidenceLinkedApproval:
 
     def test_approval_succeeds_with_valid_evidence_id(self, governor):
         gov, registry = governor
-        amendment = _amendment("prop-ev")
+        amendment = _bind_hash(gov, _amendment("prop-ev"))
         result = gov.approve_amendment(amendment, evidence_ids=["ev-1"], reviewer="human")
         assert result.success is True
 
     def test_audit_entry_records_evidence_ids(self, governor):
         gov, registry = governor
-        amendment = _amendment("prop-ev")
+        amendment = _bind_hash(gov, _amendment("prop-ev"))
         result = gov.approve_amendment(amendment, evidence_ids=["ev-1"], reviewer="human")
         assert result.success is True
         entry = result.audit_log[0]
@@ -71,7 +80,7 @@ class TestEvidenceLinkedApproval:
 class TestReviewerNotProposer:
     def test_self_approval_blocked(self, governor):
         gov, registry = governor
-        amendment = _amendment("prop-self", proposer="steward", reviewer="steward")
+        amendment = _bind_hash(gov, _amendment("prop-self", proposer="steward", reviewer="steward"))
         result = gov.approve_amendment(amendment, evidence_ids=["ev-1"], reviewer="steward")
         assert result.success is False
         assert "Self-approval blocked" in result.reason

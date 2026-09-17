@@ -66,9 +66,9 @@ class TestEndToEndEvolution:
         )
 
     def _record_failures(self, count: int = 4):
-        """Record telemetry for a repeated failure of the same task class."""
+        """Record trusted, attributed telemetry for a repeated failure class."""
         for i in range(count):
-            self.telemetry_store.record_execution(ExecutionTelemetry(
+            telemetry = ExecutionTelemetry(
                 run_id="",
                 runtime_id="runtime-v0",
                 runtime_version="v0",
@@ -80,7 +80,22 @@ class TestEndToEndEvolution:
                 tools_used=[],
                 latency_ms=150.0,
                 cost=0.01,
-            ))
+            )
+            # Attribute as internal operator telemetry so it is eligible for analysis.
+            telemetry = self._attribute_telemetry(telemetry)
+            self.telemetry_store.record_execution(telemetry)
+
+    def _attribute_telemetry(self, telemetry):
+        """Mark telemetry as trusted operator-produced attribution."""
+        telemetry.source = "operator"
+        telemetry.trusted = True
+        telemetry.runtime_manifest_hash = (
+            self.registry.get_current().manifest_hash
+            if self.registry.get_current()
+            else None
+        )
+        telemetry.operation = {"verb": "execute_task", "task_id": telemetry.task_id}
+        return telemetry
 
     def test_operator_repeated_failures_detected(self):
         """Step 1: Operator repeatedly fails a class of tasks; telemetry detects it."""
@@ -140,7 +155,12 @@ class TestEndToEndEvolution:
             candidate_runtime=candidate_result.runtime_version,
             correctness=candidate_result.correctness_avg,
             instruction_following=candidate_result.instruction_following_avg,
+            robustness=candidate_result.robustness_score,
             safety=candidate_result.safety_score,
+            latency_ms=candidate_result.latency_avg_ms,
+            cost_per_task=candidate_result.cost_avg,
+            parent_latency_ms=parent_result.latency_avg_ms,
+            parent_cost_per_task=parent_result.cost_avg,
             regressions=candidate_result.regressions,
             evidence=[Evidence(
                 id="ev-001",
@@ -177,6 +197,12 @@ class TestEndToEndEvolution:
             assert gate in gate_result["gates_passed"]
         assert gate_result["success"] is True
 
+    def _bind_evaluation_candidate(self, amendment):
+        """Stamp the exact evaluated candidate's manifest hash onto the evaluation (P5)."""
+        candidate_manifest = self.governor.build_candidate(amendment)
+        amendment.evaluation.candidate_manifest_hash = candidate_manifest.manifest_hash
+        return amendment
+
     def test_governor_approval_creates_new_runtime(self):
         """Steps 7-8: Human approves; new immutable runtime created; old stays for rollback."""
         self._create_v0()
@@ -188,8 +214,11 @@ class TestEndToEndEvolution:
             candidate_runtime="v1",
             correctness=0.91,
             instruction_following=0.92,
+            robustness=0.9,
             safety=1.0,
             regressions=0,
+            latency_ms=100.0, cost_per_task=0.01,
+            parent_latency_ms=100.0, parent_cost_per_task=0.01,
             evidence=[Evidence(id="ev-002", type="replay", description="Replay evidence", runtime_version="v1")],
             evaluator_id="evaluator:v0",
         )
@@ -208,6 +237,8 @@ class TestEndToEndEvolution:
             reviewer="human:approver-1",
             decided_at=datetime.utcnow(),
         )
+
+        self._bind_evaluation_candidate(amendment)
 
         promotion_result = self.governor.approve_amendment(amendment, evidence_ids=["ev-002"])
         assert promotion_result.success is True
@@ -257,8 +288,11 @@ class TestEndToEndEvolution:
             candidate_runtime="v1",
             correctness=0.92,
             instruction_following=0.94,
+            robustness=0.9,
             safety=1.0,
             regressions=0,
+            latency_ms=100.0, cost_per_task=0.01,
+            parent_latency_ms=100.0, parent_cost_per_task=0.01,
             evidence=[Evidence(id="ev-audit-1", type="replay", description="Replay evidence", runtime_version="v1")],
             evaluator_id="evaluator:v0",
         )
@@ -275,6 +309,8 @@ class TestEndToEndEvolution:
             reviewer="human:auditor",
             decided_at=datetime.utcnow(),
         )
+
+        self._bind_evaluation_candidate(amendment)
 
         promotion_result = self.governor.approve_amendment(amendment, evidence_ids=["ev-audit-1"])
         assert promotion_result.success is True
@@ -330,7 +366,12 @@ class TestEndToEndEvolution:
             candidate_runtime="v1",
             correctness=candidate_result.correctness_avg,
             instruction_following=candidate_result.instruction_following_avg,
+            robustness=candidate_result.robustness_score,
             safety=candidate_result.safety_score,
+            latency_ms=candidate_result.latency_avg_ms,
+            cost_per_task=candidate_result.cost_avg,
+            parent_latency_ms=parent_result.latency_avg_ms,
+            parent_cost_per_task=parent_result.cost_avg,
             regressions=candidate_result.regressions,
             evidence=[Evidence(
                 id="ev-pipeline",
@@ -361,6 +402,8 @@ class TestEndToEndEvolution:
             reviewer="human:approver-1",
             decided_at=datetime.utcnow(),
         )
+
+        self._bind_evaluation_candidate(amendment)
 
         # 4. Governance gate + human approval
         promotion = self.governor.approve_amendment(amendment, evidence_ids=["ev-pipeline"])

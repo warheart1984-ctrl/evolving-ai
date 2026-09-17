@@ -33,6 +33,7 @@ class TestFailureClassification:
                 run_id="", runtime_id="runtime-v0", runtime_version="v0",
                 task_id="task-001", input={"expression": "2+2"},
                 output="5", success=False, errors=["Incorrect answer"],
+                source="operator", trusted=True,
             )
         )
         rec = store.get_record(run_id)
@@ -46,6 +47,7 @@ class TestFailureClassification:
                 run_id="", runtime_id="runtime-v0", runtime_version="v0",
                 task_id=f"t-{i}", input={"expression": "2+2"}, output="5",
                 success=False, errors=["Incorrect answer"],
+                source="operator", trusted=True,
             ))
         counts = store.get_failure_classes()
         assert counts == {"math:incorrect-answer": 3}

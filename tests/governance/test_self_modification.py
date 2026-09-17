@@ -64,7 +64,9 @@ class TestUnauthorizedSelfModification:
         _, registry, governor, _, _ = system
         evaluation = Evaluation(
             id="eval-1", amendment_id="prop-1", parent_runtime="v0", candidate_runtime="v1",
-            correctness=0.95, instruction_following=0.92, safety=1.0, regressions=0,
+            correctness=0.95, instruction_following=0.92, robustness=0.9, safety=1.0, regressions=0,
+            latency_ms=100.0, cost_per_task=0.01,
+            parent_latency_ms=100.0, parent_cost_per_task=0.01,
             evidence=[Evidence(id="ev-1", type="replay", description="replay", runtime_version="v1")],
         )
         amendment = Amendment(

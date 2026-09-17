@@ -27,6 +27,7 @@ class TestConstitution:
             candidate_runtime="v1",
             correctness=0.90,
             instruction_following=0.88,
+            robustness=0.90,
             safety=1.0,
             regressions=0,
             evidence=[],
@@ -45,6 +46,7 @@ class TestConstitution:
             candidate_runtime="v1",
             correctness=0.50,
             instruction_following=0.40,
+            robustness=0.50,
             safety=1.0,
             regressions=0,
             evidence=[],
@@ -52,6 +54,16 @@ class TestConstitution:
             failed_gates=[],
         )
         result = ConstitutionGates.check_required_tests(eval_fail)
+        assert result.passed == False
+
+    def test_required_tests_fails_closed_without_robustness(self):
+        """A missing robustness score must fail the gate (fail closed)."""
+        eval_no_robustness = Evaluation(
+            id="eval-1", amendment_id="prop-1", parent_runtime="v0",
+            candidate_runtime="v1", correctness=0.95, instruction_following=0.95,
+            safety=1.0, regressions=0, evidence=[],
+        )
+        result = ConstitutionGates.check_required_tests(eval_no_robustness)
         assert result.passed == False
     
     def test_gates_check_no_safety_failures(self):
@@ -95,7 +107,9 @@ class TestConstitution:
         eval_good = Evaluation(
             id="eval-1", amendment_id="prop-1", parent_runtime="v0",
             candidate_runtime="v1", correctness=0.92, instruction_following=0.89,
-            safety=1.0, regressions=0,
+            robustness=0.9, safety=1.0, regressions=0,
+            latency_ms=100.0, cost_per_task=0.01,
+            parent_latency_ms=100.0, parent_cost_per_task=0.01,
             evidence=[Evidence(id="ev-1", type="replay", description="replay", runtime_version="v1")],
             passed_gates=[], failed_gates=[],
         )
@@ -105,6 +119,61 @@ class TestConstitution:
         assert "no_safety_failures" in passed
         assert "no_unexplained_regressions" in passed
         assert "evaluation_evidence_exists" in passed
+
+    def test_all_gates_bind_all_constitution_gates(self):
+        """Every gate declared in the constitution must be evaluated."""
+        from constitution.constitution import Constitution
+        c = Constitution()
+        declared = set(c.promotion_gates.keys())
+        eval_good = Evaluation(
+            id="eval-1", amendment_id="prop-1", parent_runtime="v0",
+            candidate_runtime="v1", correctness=0.92, instruction_following=0.89,
+            robustness=0.9, safety=1.0, regressions=0,
+            latency_ms=100.0, cost_per_task=0.01,
+            parent_latency_ms=100.0, parent_cost_per_task=0.01,
+            evidence=[Evidence(id="ev-1", type="replay", description="replay", runtime_version="v1")],
+        )
+        all_gates = ConstitutionGates.check_all_gates(eval_good, c)
+        assert set(all_gates.keys()) == declared | {"latency_within_budget", "cost_within_budget"}
+
+    def test_delta_gates_fail_closed_without_parent_metrics(self):
+        """Missing parent-relative metrics must fail the delta gates closed."""
+        eval_missing = Evaluation(
+            id="eval-1", amendment_id="prop-1", parent_runtime="v0",
+            candidate_runtime="v1", correctness=0.92, instruction_following=0.89,
+            robustness=0.9, safety=1.0, regressions=0,
+            latency_ms=100.0, cost_per_task=0.01,
+            evidence=[Evidence(id="ev-1", type="replay", description="replay", runtime_version="v1")],
+        )
+        gates = ConstitutionGates.check_all_gates(eval_missing)
+        assert gates["latency_within_budget"].passed is False
+        assert gates["cost_within_budget"].passed is False
+
+    def test_delta_gates_pass_within_budget(self):
+        eval_budget = Evaluation(
+            id="eval-1", amendment_id="prop-1", parent_runtime="v0",
+            candidate_runtime="v1", correctness=0.92, instruction_following=0.89,
+            robustness=0.9, safety=1.0, regressions=0,
+            latency_ms=110.0, cost_per_task=0.011,
+            parent_latency_ms=100.0, parent_cost_per_task=0.01,
+            evidence=[Evidence(id="ev-1", type="replay", description="replay", runtime_version="v1")],
+        )
+        gates = ConstitutionGates.check_all_gates(eval_budget)
+        assert gates["latency_within_budget"].passed is True   # +10% <= 20%
+        assert gates["cost_within_budget"].passed is True      # +10% <= 15%
+
+    def test_delta_gates_fail_over_budget(self):
+        eval_over = Evaluation(
+            id="eval-1", amendment_id="prop-1", parent_runtime="v0",
+            candidate_runtime="v1", correctness=0.92, instruction_following=0.89,
+            robustness=0.9, safety=1.0, regressions=0,
+            latency_ms=150.0, cost_per_task=0.03,
+            parent_latency_ms=100.0, parent_cost_per_task=0.01,
+            evidence=[Evidence(id="ev-1", type="replay", description="replay", runtime_version="v1")],
+        )
+        gates = ConstitutionGates.check_all_gates(eval_over)
+        assert gates["latency_within_budget"].passed is False   # +50% > 20%
+        assert gates["cost_within_budget"].passed is False      # +200% > 15%
 
 
 class TestAmendment:
@@ -195,7 +264,9 @@ class TestConstitutionGatesAll:
         eval_result = Evaluation(
             id="eval-1", amendment_id="prop-1", parent_runtime="v0",
             candidate_runtime="v1", correctness=0.95, instruction_following=0.92,
-            safety=1.0, regressions=0,
+            robustness=0.9, safety=1.0, regressions=0,
+            latency_ms=100.0, cost_per_task=0.01,
+            parent_latency_ms=100.0, parent_cost_per_task=0.01,
             evidence=[Evidence(id="ev-1", type="replay", description="replay", runtime_version="v1")],
             passed_gates=[],
             failed_gates=[],

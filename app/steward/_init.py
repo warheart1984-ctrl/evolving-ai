@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from app.evaluation.arithmetic import safe_arithmetic
 from app.governance.models import AmendmentStatus, RegressionCase, TargetType
 from app.governance.registry import RuntimeRegistry
 
@@ -203,12 +204,10 @@ class Steward:
             if isinstance(sample, dict) and "expression" in sample:
                 task_type = "math"
                 expression = str(sample["expression"])
-                allowed = set("0123456789+-*/(). ")
-                if expression and set(expression) <= allowed:
-                    try:
-                        expected_output = str(eval(expression))
-                    except Exception:
-                        pass
+                try:
+                    expected_output = str(safe_arithmetic(expression))
+                except ArithmeticError:
+                    pass
 
             # Build unique ID from failure class + input hash
             input_str = str(sorted(sample.items())) if isinstance(sample, dict) else str(sample)

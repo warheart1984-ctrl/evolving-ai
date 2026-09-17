@@ -154,6 +154,17 @@ class Governor:
 
     def materialize_candidate(self, amendment: Amendment) -> RuntimeManifest:
         """Apply an amendment to a cloned manifest and register it in SANDBOX."""
+        candidate = self.build_candidate(amendment)
+        amendment.status = AmendmentStatus.SANDBOX
+        return self.registry.register_candidate(candidate)
+
+    def build_candidate(self, amendment: Amendment) -> RuntimeManifest:
+        """Build (but do NOT register) the sandbox candidate manifest for an amendment.
+
+        Used both to materialize candidates for evaluation and to re-compute the
+        exact candidate at approval time so approval binds to the precise manifest
+        that was evaluated (P5).
+        """
         reason = self.validate_diff(amendment)
         if reason:
             raise ValueError(reason)
@@ -165,6 +176,7 @@ class Governor:
             id=f"runtime-{parent.version}-candidate-{amendment.id}",
             version=f"{parent.version}-candidate-{amendment.id}",
             parent_version=parent.version,
+            kind="sandbox",
             model_identifier=parent.model_identifier,
             constitution_version=parent.constitution_version,
             prompts=config.get("prompts", {}),
@@ -175,8 +187,7 @@ class Governor:
             description=f"SANDBOX candidate for {amendment.id}",
             amendment_id=amendment.id,
         )
-        amendment.status = AmendmentStatus.SANDBOX
-        return self.registry.register_candidate(candidate)
+        return RuntimeRegistry._with_hash(candidate)
 
     def approve_amendment(
         self,
@@ -231,6 +242,34 @@ class Governor:
         invalid_ids = set(evidence_ids) - valid_evidence_ids
         if invalid_ids:
             result.reason = f"Approval references unknown evidence: {sorted(invalid_ids)}"
+            return result
+
+        # 5b. Evidence must be intact: the referenced evidence payloads must
+        # still match their canonical hashes (P5, tamper detection).
+        tampered = [
+            e.id for e in amendment.evaluation.evidence
+            if e.id in evidence_ids and not e.is_intact()
+        ]
+        if tampered:
+            result.reason = (
+                f"Approval blocked: evidence modified after evaluation "
+                f"(canonical hash mismatch): {sorted(tampered)}"
+            )
+            return result
+
+        # 5c. Exact-candidate binding (P5): the amendment's proposed_diff must
+        # re-materialize to the EXACT sandbox candidate manifest that was
+        # evaluated. A changed candidate can never be approved on stale evidence.
+        expected_hash = amendment.evaluation.candidate_manifest_hash
+        if not expected_hash:
+            result.reason = "Approval blocked: no candidate manifest hash recorded; cannot bind to evaluated candidate"
+            return result
+        rebuilt = self.build_candidate(amendment)
+        if rebuilt.manifest_hash != expected_hash:
+            result.reason = (
+                "Approval blocked: candidate changed since evaluation "
+                f"(manifest hash mismatch). Re-evaluate the amendment before approval."
+            )
             return result
 
         # 6. Reviewer must not be the proposer

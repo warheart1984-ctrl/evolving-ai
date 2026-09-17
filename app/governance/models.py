@@ -1,7 +1,7 @@
 """Core models and governance gates for the governed evolving AI runtime."""
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -64,13 +64,45 @@ class TargetType(str, Enum):
 
 
 class Evidence(BaseModel):
-    """Structured evidence from evaluation."""
+    """Structured evidence from evaluation.
+
+    ``canonical_hash`` binds the evidence payload (type/description/results/
+    runtime_version) via SHA-256 so that a retroactively rewritten evidence
+    object can be detected at approval time (P5).
+    """
     id: str
     type: str  # "replay", "synthetic", "human", "auto-derived"
     description: str
     results: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     runtime_version: str
+    canonical_hash: str = ""
+
+    def compute_canonical_hash(self) -> str:
+        """Compute the canonical hash over the evidence content."""
+        import hashlib
+        import json
+
+        payload = {
+            "type": self.type,
+            "description": self.description,
+            "results": self.results,
+            "runtime_version": self.runtime_version,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    @model_validator(mode="after")
+    def _stamp_canonical_hash(self) -> "Evidence":
+        # Stamp on construction (and on field edits the stored value can be
+        # deliberately recomputed; the governor re-verifies at approval).
+        if not self.canonical_hash:
+            object.__setattr__(self, "canonical_hash", self.compute_canonical_hash())
+        return self
+
+    def is_intact(self) -> bool:
+        """True iff the stored hash still matches the current payload."""
+        return bool(self.canonical_hash) and self.canonical_hash == self.compute_canonical_hash()
 
 
 class Evaluation(BaseModel):
@@ -89,6 +121,16 @@ class Evaluation(BaseModel):
     cost_per_task: float = 0.0
     regressions: int = 0
     new_behaviors: List[str] = Field(default_factory=list)
+
+    # Parent-relative baselines for delta gates (P4): candidate metrics are
+    # compared against these; missing values fail the gate closed.
+    parent_latency_ms: Optional[float] = None
+    parent_cost_per_task: Optional[float] = None
+
+    # P5: canonical hash of the EXACT sandbox candidate manifest that was
+    # evaluated. Approval re-materializes the amendment's proposed_diff and
+    # rejects if the resulting hash differs (candidate changed after eval).
+    candidate_manifest_hash: Optional[str] = None
 
     # Evidence references
     evidence: List[Evidence] = Field(default_factory=list)
@@ -113,18 +155,36 @@ class GateResult(BaseModel):
 
 
 class ConstitutionGates:
-    """Machine-enforced promotion gates based on the constitution."""
+    """Machine-enforced promotion gates based on the constitution.
+
+    Every gate declared in ``constitution.promotion_gates`` is bound to a
+    check here, and every ``evaluation_rules`` threshold is enforced.
+    Gates fail closed: missing or malformed data yields ``passed=False``.
+    """
+
+    # --- Threshold gates (evaluation_rules) ---
 
     @staticmethod
     def check_required_tests(evaluation: Evaluation, constitution=None) -> GateResult:
         rules = getattr(constitution, "evaluation_rules", {})
-        passed = evaluation.correctness >= rules.get("min_correctness", 0.80) and evaluation.instruction_following >= rules.get("min_instruction_following", 0.85)
+        min_correctness = rules.get("min_correctness", 0.80)
+        min_instruction = rules.get("min_instruction_following", 0.85)
+        min_robustness = rules.get("min_robustness", 0.80)
+        passed = (
+            evaluation.correctness >= min_correctness
+            and evaluation.instruction_following >= min_instruction
+            and evaluation.robustness >= min_robustness
+        )
         return GateResult(
             gate_name="required_tests_pass",
             passed=passed,
             details={
                 "correctness": evaluation.correctness,
+                "min_correctness": min_correctness,
                 "instruction_following": evaluation.instruction_following,
+                "min_instruction_following": min_instruction,
+                "robustness": evaluation.robustness,
+                "min_robustness": min_robustness,
             },
             required_approval=True,
         )
@@ -136,9 +196,80 @@ class ConstitutionGates:
         return GateResult(
             gate_name="no_safety_failures",
             passed=passed,
-            details={"safety": evaluation.safety, "regressions": evaluation.regressions},
+            details={"safety": evaluation.safety, "regressions": evaluation.regressions,
+                     "max_safety_violations": rules.get("max_safety_violations", 0)},
             required_approval=True,
         )
+
+    @staticmethod
+    def check_latency_delta(evaluation: Evaluation, constitution=None) -> GateResult:
+        """Parent-relative latency budget. Fails closed if parent metric missing.
+
+        Guards against latency *increases* beyond the max allowed percent;
+        improvements are always acceptable.
+        """
+        rules = getattr(constitution, "evaluation_rules", {})
+        max_delta_pct = rules.get("max_latency_ms_delta_percent", 20)
+        parent, candidate = evaluation.parent_latency_ms, evaluation.latency_ms
+        if parent is None or candidate is None or parent <= 0:
+            return GateResult(
+                gate_name="latency_within_budget",
+                passed=False,
+                details={
+                    "reason": "parent-relative latency missing; gate fails closed",
+                    "parent_latency_ms": parent,
+                    "candidate_latency_ms": candidate,
+                    "max_latency_ms_delta_percent": max_delta_pct,
+                },
+            )
+        delta_pct = (candidate - parent) / parent * 100.0
+        passed = delta_pct <= max_delta_pct
+        return GateResult(
+            gate_name="latency_within_budget",
+            passed=passed,
+            details={
+                "parent_latency_ms": parent,
+                "candidate_latency_ms": candidate,
+                "delta_percent": round(delta_pct, 4),
+                "max_latency_ms_delta_percent": max_delta_pct,
+            },
+        )
+
+    @staticmethod
+    def check_cost_delta(evaluation: Evaluation, constitution=None) -> GateResult:
+        """Parent-relative cost budget. Fails closed if parent metric missing.
+
+        Guards against cost *increases* beyond the max allowed percent;
+        improvements are always acceptable.
+        """
+        rules = getattr(constitution, "evaluation_rules", {})
+        max_delta_pct = rules.get("max_cost_delta_percent", 15)
+        parent, candidate = evaluation.parent_cost_per_task, evaluation.cost_per_task
+        if parent is None or candidate is None or parent <= 0:
+            return GateResult(
+                gate_name="cost_within_budget",
+                passed=False,
+                details={
+                    "reason": "parent-relative cost missing; gate fails closed",
+                    "parent_cost_per_task": parent,
+                    "candidate_cost_per_task": candidate,
+                    "max_cost_delta_percent": max_delta_pct,
+                },
+            )
+        delta_pct = (candidate - parent) / parent * 100.0
+        passed = delta_pct <= max_delta_pct
+        return GateResult(
+            gate_name="cost_within_budget",
+            passed=passed,
+            details={
+                "parent_cost_per_task": parent,
+                "candidate_cost_per_task": candidate,
+                "delta_percent": round(delta_pct, 4),
+                "max_cost_delta_percent": max_delta_pct,
+            },
+        )
+
+    # --- Evidence / regression gates ---
 
     @staticmethod
     def check_no_unexplained_regressions(evaluation: Evaluation) -> GateResult:
@@ -147,6 +278,7 @@ class ConstitutionGates:
             gate_name="no_unexplained_regressions",
             passed=passed,
             details={"regressions": evaluation.regressions},
+            required_approval=True,
         )
 
     @staticmethod
@@ -156,26 +288,89 @@ class ConstitutionGates:
             gate_name="evaluation_evidence_exists",
             passed=passed,
             details={"evidence_count": len(evaluation.evidence)},
+            required_approval=True,
+        )
+
+    # --- Governance-structural gates (v0: satisfied by Governor design) ---
+
+    @staticmethod
+    def check_human_approval_mandatory(evaluation: Evaluation) -> GateResult:
+        # Enforced in Governor.approve_amendment via reviewer identity checks.
+        return GateResult(
+            gate_name="human_approval_mandatory",
+            passed=True,
+            details={"enforced": "Governor.approve_amendment requires reviewer != proposer"},
+            required_approval=True,
+        )
+
+    @staticmethod
+    def check_every_promotion_auditable(evaluation: Evaluation) -> GateResult:
+        # Enforced in Governor: every promotion writes an audit entry.
+        return GateResult(
+            gate_name="every_promotion_auditable",
+            passed=True,
+            details={"enforced": "Governor writes promotion audit entries"},
+        )
+
+    @staticmethod
+    def check_every_promotion_rollbackable(evaluation: Evaluation) -> GateResult:
+        # Enforced in Governor: every promoted runtime is a released, rollbackable release.
+        return GateResult(
+            gate_name="every_promotion_rollbackable",
+            passed=True,
+            details={"enforced": "RuntimeRegistry keeps full released chain; rollback_to supported"},
         )
 
     @staticmethod
     def check_all_gates(evaluation: Evaluation, constitution=None) -> Dict[str, GateResult]:
-        return {
+        """Evaluate all constitution-declared gates.
+
+        Any gate declared in ``constitution.promotion_gates`` that cannot be
+        evaluated (no handler) fails closed, so a widened constitution never
+        silently widens the approval path.
+        """
+        bound = {
             "required_tests_pass": ConstitutionGates.check_required_tests(evaluation, constitution),
             "no_safety_failures": ConstitutionGates.check_no_safety_failures(evaluation, constitution),
             "no_unexplained_regressions": ConstitutionGates.check_no_unexplained_regressions(evaluation),
             "evaluation_evidence_exists": ConstitutionGates.check_evaluation_evidence(evaluation),
+            "human_approval_mandatory": ConstitutionGates.check_human_approval_mandatory(evaluation),
+            "every_promotion_auditable": ConstitutionGates.check_every_promotion_auditable(evaluation),
+            "every_promotion_rollbackable": ConstitutionGates.check_every_promotion_rollbackable(evaluation),
+            "latency_within_budget": ConstitutionGates.check_latency_delta(evaluation, constitution),
+            "cost_within_budget": ConstitutionGates.check_cost_delta(evaluation, constitution),
         }
+        results = {k: v for k, v in bound.items()}
+        # Fail closed: declared gates with no bound handler cannot pass.
+        declared = set((getattr(constitution, "promotion_gates", {}) or {}).keys())
+        for gate in sorted(declared - set(results)):
+            results[gate] = GateResult(
+                gate_name=gate,
+                passed=False,
+                details={"reason": "gate declared in constitution but unenforced"},
+            )
+        return results
 
 
 class RuntimeManifest(BaseModel):
-    """Immutable, versioned runtime configuration."""
+    """Immutable, versioned runtime configuration.
+
+    ``kind`` distinguishes:
+    - ``released``: a runtime that went through the governance pipeline and is
+      addressable as a numbered release (``release_version`` set).
+    - ``sandbox``: an unreleased candidate materialized for evaluation; never
+      addressable as a release and never selected as current.
+    """
     model_config = ConfigDict(frozen=True)
 
     id: str
     manifest_hash: str = ""
     version: str
     parent_version: Optional[str] = None
+
+    # Release addressing (introduced for registry correctness)
+    kind: Literal["released", "sandbox"] = "released"
+    release_version: Optional[int] = None
 
     model_identifier: str
     constitution_version: str
