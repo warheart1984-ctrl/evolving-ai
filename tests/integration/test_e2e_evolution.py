@@ -209,7 +209,7 @@ class TestEndToEndEvolution:
             decided_at=datetime.utcnow(),
         )
 
-        promotion_result = self.governor.approve_amendment(amendment)
+        promotion_result = self.governor.approve_amendment(amendment, evidence_ids=["ev-002"])
         assert promotion_result.success is True
 
         new_runtime = self.registry.get_runtime(promotion_result.new_runtime_id)
@@ -276,7 +276,7 @@ class TestEndToEndEvolution:
             decided_at=datetime.utcnow(),
         )
 
-        promotion_result = self.governor.approve_amendment(amendment)
+        promotion_result = self.governor.approve_amendment(amendment, evidence_ids=["ev-audit-1"])
         assert promotion_result.success is True
         assert len(promotion_result.audit_log) > 0
 
@@ -363,7 +363,7 @@ class TestEndToEndEvolution:
         )
 
         # 4. Governance gate + human approval
-        promotion = self.governor.approve_amendment(amendment)
+        promotion = self.governor.approve_amendment(amendment, evidence_ids=["ev-pipeline"])
         assert promotion.success is True
 
         # 5. New immutable runtime exists; old one preserved

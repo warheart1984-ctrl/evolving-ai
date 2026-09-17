@@ -116,6 +116,7 @@ class FailureClassRegistry:
             self._classes[class_id] = FailureClass(
                 id=class_id,
                 description=description,
+                occurrence_count=1,
                 source_amendments=[source_amendment] if source_amendment else [],
             )
 

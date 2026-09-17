@@ -9,6 +9,7 @@ Constitution as root of trust:
   separate quorum process, not the standard amendment pipeline.
 """
 import hashlib
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -123,6 +124,3 @@ class Constitution(BaseModel):
 
         data["content_hash"] = actual_hash
         return cls(**data)
-
-
-import os  # noqa: E402 (needed at module level for from_file)
